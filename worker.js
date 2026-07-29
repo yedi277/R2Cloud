@@ -1,3 +1,4 @@
+// JavaScript source code
 /**
 name = "mycloud"
 
@@ -231,6 +232,32 @@ function htmlResponse(html, status = 200, headers = {}) {
       ...headers
     }
   });
+}
+
+async function handleImgbedServe(request, env, imgId) {
+    try {
+        const raw = await env.KV_STORE.get(`imgbed:${imgId}`);
+        if (!raw) return new Response('Not Found', { status: 404 });
+
+        const imgbed = JSON.parse(raw);
+        if (!imgbed.enabled) return new Response('Not Found', { status: 404 });
+
+        const object = await env.R2_BUCKET.get(imgbed.filePath);
+        if (!object) return new Response('Not Found', { status: 404 });
+
+        const filename = imgbed.filePath.split('/').pop();
+        return new Response(object.body, {
+            headers: {
+                'Content-Type': object.httpMetadata?.contentType || getMimeType(filename),
+                'Content-Length': object.size,
+                // 图床关键：内联显示 + 公开缓存 + CORS
+                'Cache-Control': 'public, max-age=31536000, immutable',
+                'Access-Control-Allow-Origin': '*',
+            }
+        });
+    } catch (e) {
+        return new Response('Internal Server Error', { status: 500 });
+    }
 }
 
 async function handleLogin(request, env) {
@@ -787,6 +814,64 @@ async function serveFile(request, env, path, { download = false, cache = false }
   } catch (e) {
     return jsonResponse({ success: false, message: (download ? '下载' : '预览') + '失败: ' + e.message }, 500);
   }
+}
+
+async function handleImgbedToggle(request, env) {
+    const auth = await requireAuth(request, env);
+    if (auth instanceof Response) return auth;
+    if (auth.role === 'guest') return jsonResponse({ success: false, message: '游客无权操作' }, 403);
+
+    try {
+        const { filePath, enabled } = await request.json();
+        const key = normalizePath(filePath);
+
+        const object = await env.R2_BUCKET.head(key);
+        if (!object) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+
+        const accessErr = await checkPathAccess(auth, env, key);
+        if (accessErr) return accessErr;
+
+        if (enabled) {
+            const existing = await env.KV_STORE.get(`imgbed-ref:${key}`);
+            if (existing) {
+                return jsonResponse({ success: true, imgId: existing, url: `/i/${existing}` });
+            }
+            const imgId = generateId(12);
+            await env.KV_STORE.put(`imgbed:${imgId}`, JSON.stringify({
+                imgId, filePath: key, owner: auth.email || 'admin', enabled: true, createdAt: Date.now()
+            }));
+            await env.KV_STORE.put(`imgbed-ref:${key}`, imgId);
+            return jsonResponse({ success: true, imgId, url: `/i/${imgId}` });
+        } else {
+            const refRaw = await env.KV_STORE.get(`imgbed-ref:${key}`);
+            if (!refRaw) return jsonResponse({ success: true, message: '未开启图床' });
+            await env.KV_STORE.delete(`imgbed:${refRaw}`);
+            await env.KV_STORE.delete(`imgbed-ref:${key}`);
+            return jsonResponse({ success: true, message: '图床已关闭' });
+        }
+    } catch (e) {
+        return jsonResponse({ success: false, message: '操作失败: ' + e.message }, 500);
+    }
+}
+
+async function handleImgbedStatus(request, env) {
+    const auth = await requireAuth(request, env);
+    if (auth instanceof Response) return auth;
+
+    try {
+        const { paths } = await request.json();
+        const statusMap = {};
+        if (Array.isArray(paths)) {
+            for (const p of paths) {
+                const key = normalizePath(p);
+                const refRaw = await env.KV_STORE.get(`imgbed-ref:${key}`);
+                if (refRaw) statusMap[p] = refRaw;
+            }
+        }
+        return jsonResponse({ success: true, statusMap });
+    } catch (e) {
+        return jsonResponse({ success: false, message: '查询失败: ' + e.message }, 500);
+    }
 }
 
 async function handleEditFile(request, env, path) {
@@ -1923,6 +2008,18 @@ const CSS_STYLES = `
   .badge-error { background: rgba(255,59,48,0.12); color: var(--error); }
   .badge-info { background: rgba(0,122,255,0.12); color: var(--primary); }
   .badge-guest { background: rgba(175,82,222,0.12); color: #af52de; }
+  .badge-imgbed {
+  background: rgba(0, 122, 255, 0.12);
+  color: var(--primary);
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+[data-theme="dark"] .badge-imgbed {
+  background: rgba(10, 132, 255, 0.2);
+}
   .table-container { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border); }
@@ -2706,7 +2803,84 @@ const INDEX_PAGE = `
 
     let searchTimer = null;
     let pendingSelectFile = null;
-
+    // 图床状态缓存（避免每次右键都查询 API）
+    let imgbedCache = {};  // { filePath: imgId | null }
+ 
+    // 加载当前目录下所有文件的图床状态
+    async function loadImgbedStatus(files) {
+      try {
+        const paths = files.map(f => f.path);
+        const res = await fetch('/api/imgbed/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paths })
+        });
+        const data = await res.json();
+        if (data.success) {
+          imgbedCache = data.statusMap || {};  // { "/path/to/file.jpg": "aB3xKm9Pq2Rs" }
+        }
+      } catch (e) {
+        imgbedCache = {};
+      }
+    }
+ 
+    // 切换图床开关
+    async function toggleImgbed(path, name) {
+      const currentId = imgbedCache[path];
+      const enabling = !currentId;
+  
+      try {
+        const res = await fetch('/api/imgbed/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filePath: path, enabled: enabling })
+        });
+        const data = await res.json();
+    
+        if (data.success) {
+          if (enabling) {
+            imgbedCache[path] = data.imgId;
+            showToast('图床已开启，链接：' + data.url, 'success');
+            // 自动复制到剪贴板
+            copyToClipboard(window.location.origin + data.url);
+          } else {
+            imgbedCache[path] = null;
+            showToast('图床已关闭', 'success');
+          }
+          loadFiles();  // 刷新列表，更新图标标记
+        } else {
+          showToast(data.message || '操作失败', 'error');
+        }
+      } catch (e) {
+        showToast('图床操作失败', 'error');
+      }
+    }
+ 
+    // 复制图床直链
+    function copyImgbedUrl(path) {
+      const imgId = imgbedCache[path];
+      if (!imgId) {
+        showToast('该文件未开启图床', 'warning');
+        return;
+      }
+      const url = window.location.origin + '/i/' + imgId;
+      copyToClipboard(url);
+      showToast('图床链接已复制', 'success');
+    }
+ 
+    // 通用剪贴板复制
+    function copyToClipboard(text) {
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+    }
     function handleSearch(event) {
       clearTimeout(searchTimer);
       const input = document.getElementById('searchInput');
@@ -3124,7 +3298,7 @@ function showContextMenu(event, type, path, name, previewType) {
     
     const canEdit = !previewType || previewType === 'text' || previewType === 'html';
     const canPreview = !!previewType;
-    
+    const imgId = imgbedCache[path] || '';  // 新增：读取图床状态
     menuItems = \`
       \${canEdit ? \`<div class="context-menu-item" onclick="openEditor('\${path}', '\${name}'); hideContextMenu();">
         <span>✏️</span> <span>编辑</span>
@@ -3141,6 +3315,15 @@ function showContextMenu(event, type, path, name, previewType) {
         <span>🔗</span> <span>分享</span>
       </div>
       <div class="context-menu-divider"></div>
+
+      <!-- 图床菜单：新增 -->
+      \${currentUserRole !== 'guest' ? \`<div class="context-menu-item" onclick="toggleImgbed('\${path}', '\${name}'); hideContextMenu();">
+        <span>🖼️</span> <span>\${imgId ? '关闭图床' : '开启图床'}</span>
+      </div>\` : ''}
+      \${imgId ? \`<div class="context-menu-item" onclick="copyImgbedUrl('\${path}'); hideContextMenu();">
+        <span>🔗</span> <span>复制图床链接</span>
+      </div>\` : ''}
+
       <div class="context-menu-item" onclick="showRenameModal('\${path}', '\${name}'); hideContextMenu();">
         <span>✏️</span> <span>重命名</span>
       </div>
@@ -3567,6 +3750,11 @@ function initMultiSelect() {
 
         renderBreadcrumb();
         renderFiles(data.folders, data.files);
+        
+        // 新增：加载图床状态
+        await loadImgbedStatus(data.files);
+        renderFiles(data.folders, data.files);  // 二次渲染，带上图床标记
+
       } catch (error) {
         showToast('加载文件失败: ' + error.message, 'error');
       } finally {
@@ -3687,18 +3875,23 @@ sortedFolders.forEach(folder => {
 sortedFiles.forEach(file => {
   const icon = getFileIcon(file.name);
   const previewType = file.previewType || '';
+  const imgbedBadge = imgbedCache[file.path] 
+    ? '<span class="badge badge-imgbed" title="图床已开启">🖼️</span>' 
+    : '';
+  
 
   html += \`
     <div class="file-item"
          ondblclick="handleFileClick('\${file.path}', '\${previewType}', '\${escapeHtml(file.name)}')"
-		 onclick="handleItemClick(event, this)"
-         oncontextmenu="showContextMenu(event, 'file', '\${file.path}', '\${escapeHtml(file.name)}', '\${previewType}')"
+         onclick="handleItemClick(event, this)"
+         oncontextmenu="showContextMenu(event, 'file', '\${file.path}', '\${escapeHtml(file.name)}', '\${previewType}', '\${imgbedCache[file.path] || ''}')"
          data-type="file"
          data-path="\${file.path}"
          data-name="\${escapeHtml(file.name)}"
-         data-preview-type="\${previewType}">
+         data-preview-type="\${previewType}"
+         data-imgbed="\${imgbedCache[file.path] || ''}">
       <div class="file-icon">\${icon}</div>
-      <div class="file-name">\${escapeHtml(file.name)}</div>
+      <div class="file-name">\${escapeHtml(file.name)}\${imgbedBadge}</div>
       \${viewMode === 'list' ? '<div class="file-meta" style="text-align:right;font-size:10px;color:var(--text-muted)">' + (file.timeFormatted || '-') + '</div>' : ''}
       <div class="file-meta" style="font-size:10px">\${file.sizeFormatted}\${previewType && viewMode !== 'list' ? ' <span class="badge badge-info">可预览</span>' : ''}</div>
       \${viewMode === 'list' ? '<div class="file-meta" style="text-align:right;font-size:10px;color:var(--text-muted)">' + (previewType ? '可预览 · 右键编辑' : '右键菜单') + '</div>' : ''}
@@ -5458,6 +5651,14 @@ export default {
         if (path === '/api/share' && method === 'POST') {
           return await handleCreateShare(request, env);
         }
+        // 图床路由（添加在分享路由之后）
+        if (path === '/api/imgbed/toggle' && method === 'POST') {
+            return await handleImgbedToggle(request, env);
+        }
+
+        if (path === '/api/imgbed/status' && method === 'POST') {
+            return await handleImgbedStatus(request, env);
+          }
 
         if (path.match(/^\/api\/share\/[^/]+$/) && method === 'GET') {
           const shareId = path.split('/').pop();
@@ -5535,6 +5736,11 @@ export default {
 
       if (path.startsWith('/s/')) {
         return htmlResponse(SHARE_PAGE);
+      }
+
+      if (path.startsWith('/i/')) {
+        const imgId = path.slice(3);
+        return await handleImgbedServe(request, env, imgId);
       }
 
       if (path === '/login.html' || path === '/login') {
