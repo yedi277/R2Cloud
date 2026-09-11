@@ -245,12 +245,29 @@ async function handleImgbedServe(request, env, imgId) {
         const object = await env.R2_BUCKET.get(imgbed.filePath);
         if (!object) return new Response('Not Found', { status: 404 });
 
-        const filename = imgbed.filePath.split('/').pop();
+        // 优先使用存储时的原始文件名，否则从路径解析
+        let filename = imgbed.originalName || imgbed.filePath.split('/').pop() || 'file';
+        try {
+            filename = decodeURIComponent(filename); // 处理路径中可能被 URL 编码的字符
+        } catch (_) { /* 解码失败则保留原值 */ }
+
+        // 构造符合 RFC 6266/5987 的 Content-Disposition
+        // ASCII 回退名：替换非 ASCII 字符及引号、反斜杠
+        const asciiName = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+        // UTF-8 编码名：保证中文等文件名正确显示
+        const utf8Name = encodeURIComponent(filename).replace(/'/g, '%27');
+
+        // 默认 inline（保持直连内联显示）；链接后加 ?download 可强制触发下载
+        const forceDownload = new URL(request.url).searchParams.has('download');
+        const dispositionType = forceDownload ? 'attachment' : 'inline';
+
         return new Response(object.body, {
             headers: {
                 'Content-Type': object.httpMetadata?.contentType || getMimeType(filename),
                 'Content-Length': object.size,
-                // 图床关键：内联显示 + 公开缓存 + CORS
+                // 下载时保存为原文件名
+                'Content-Disposition': `${dispositionType}; filename="${asciiName}"; filename*=UTF-8''${utf8Name}`,
+                // 直连关键：内联显示 + 公开缓存 + CORS
                 'Cache-Control': 'public, max-age=31536000, immutable',
                 'Access-Control-Allow-Origin': '*',
             }
@@ -259,7 +276,6 @@ async function handleImgbedServe(request, env, imgId) {
         return new Response('Internal Server Error', { status: 500 });
     }
 }
-
 async function handleLogin(request, env) {
   try {
     const { email, password, isAdmin, isGuest } = await request.json();
@@ -844,10 +860,10 @@ async function handleImgbedToggle(request, env) {
             return jsonResponse({ success: true, imgId, url: `/i/${imgId}` });
         } else {
             const refRaw = await env.KV_STORE.get(`imgbed-ref:${key}`);
-            if (!refRaw) return jsonResponse({ success: true, message: '未开启图床' });
+            if (!refRaw) return jsonResponse({ success: true, message: '未开启直连' });
             await env.KV_STORE.delete(`imgbed:${refRaw}`);
             await env.KV_STORE.delete(`imgbed-ref:${key}`);
-            return jsonResponse({ success: true, message: '图床已关闭' });
+            return jsonResponse({ success: true, message: '直连已关闭' });
         }
     } catch (e) {
         return jsonResponse({ success: false, message: '操作失败: ' + e.message }, 500);
@@ -2803,10 +2819,10 @@ const INDEX_PAGE = `
 
     let searchTimer = null;
     let pendingSelectFile = null;
-    // 图床状态缓存（避免每次右键都查询 API）
+    // 直连状态缓存（避免每次右键都查询 API）
     let imgbedCache = {};  // { filePath: imgId | null }
  
-    // 加载当前目录下所有文件的图床状态
+    // 加载当前目录下所有文件的直连状态
     async function loadImgbedStatus(files) {
       try {
         const paths = files.map(f => f.path);
@@ -2824,7 +2840,7 @@ const INDEX_PAGE = `
       }
     }
  
-    // 切换图床开关
+    // 切换直连开关
     async function toggleImgbed(path, name) {
       const currentId = imgbedCache[path];
       const enabling = !currentId;
@@ -2840,32 +2856,32 @@ const INDEX_PAGE = `
         if (data.success) {
           if (enabling) {
             imgbedCache[path] = data.imgId;
-            showToast('图床已开启，链接：' + data.url, 'success');
+            showToast('直连已开启，链接：' + data.url, 'success');
             // 自动复制到剪贴板
             copyToClipboard(window.location.origin + data.url);
           } else {
             imgbedCache[path] = null;
-            showToast('图床已关闭', 'success');
+            showToast('直连已关闭', 'success');
           }
           loadFiles();  // 刷新列表，更新图标标记
         } else {
           showToast(data.message || '操作失败', 'error');
         }
       } catch (e) {
-        showToast('图床操作失败', 'error');
+        showToast('直连操作失败', 'error');
       }
     }
  
-    // 复制图床直链
+    // 复制直连直链
     function copyImgbedUrl(path) {
       const imgId = imgbedCache[path];
       if (!imgId) {
-        showToast('该文件未开启图床', 'warning');
+        showToast('该文件未开启直连', 'warning');
         return;
       }
-      const url = window.location.origin + '/i/' + imgId;
+      const url = window.location.origin + '/i/' + imgId + '#' + (path.split('/').pop());
       copyToClipboard(url);
-      showToast('图床链接已复制', 'success');
+      showToast('直连链接已复制', 'success');
     }
  
     // 通用剪贴板复制
@@ -3298,7 +3314,7 @@ function showContextMenu(event, type, path, name, previewType) {
     
     const canEdit = !previewType || previewType === 'text' || previewType === 'html';
     const canPreview = !!previewType;
-    const imgId = imgbedCache[path] || '';  // 新增：读取图床状态
+    const imgId = imgbedCache[path] || '';  // 新增：读取直连状态
     menuItems = \`
       \${canEdit ? \`<div class="context-menu-item" onclick="openEditor('\${path}', '\${name}'); hideContextMenu();">
         <span>✏️</span> <span>编辑</span>
@@ -3316,12 +3332,12 @@ function showContextMenu(event, type, path, name, previewType) {
       </div>
       <div class="context-menu-divider"></div>
 
-      <!-- 图床菜单：新增 -->
+      <!-- 直连菜单：新增 -->
       \${currentUserRole !== 'guest' ? \`<div class="context-menu-item" onclick="toggleImgbed('\${path}', '\${name}'); hideContextMenu();">
-        <span>🖼️</span> <span>\${imgId ? '关闭图床' : '开启图床'}</span>
+        <span>🖼️</span> <span>\${imgId ? '关闭直连' : '开启直连'}</span>
       </div>\` : ''}
       \${imgId ? \`<div class="context-menu-item" onclick="copyImgbedUrl('\${path}'); hideContextMenu();">
-        <span>🔗</span> <span>复制图床链接</span>
+        <span>🔗</span> <span>复制直连链接</span>
       </div>\` : ''}
 
       <div class="context-menu-item" onclick="showRenameModal('\${path}', '\${name}'); hideContextMenu();">
@@ -3751,9 +3767,9 @@ function initMultiSelect() {
         renderBreadcrumb();
         renderFiles(data.folders, data.files);
         
-        // 新增：加载图床状态
+        // 新增：加载直连状态
         await loadImgbedStatus(data.files);
-        renderFiles(data.folders, data.files);  // 二次渲染，带上图床标记
+        renderFiles(data.folders, data.files);  // 二次渲染，带上直连标记
 
       } catch (error) {
         showToast('加载文件失败: ' + error.message, 'error');
@@ -3876,7 +3892,7 @@ sortedFiles.forEach(file => {
   const icon = getFileIcon(file.name);
   const previewType = file.previewType || '';
   const imgbedBadge = imgbedCache[file.path] 
-    ? '<span class="badge badge-imgbed" title="图床已开启">🖼️</span>' 
+    ? '<span class="badge badge-imgbed" title="直连已开启">🔗</span>' 
     : '';
   
 
@@ -5651,7 +5667,7 @@ export default {
         if (path === '/api/share' && method === 'POST') {
           return await handleCreateShare(request, env);
         }
-        // 图床路由（添加在分享路由之后）
+        // 直连路由（添加在分享路由之后）
         if (path === '/api/imgbed/toggle' && method === 'POST') {
             return await handleImgbedToggle(request, env);
         }
