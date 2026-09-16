@@ -11,6 +11,8 @@ bucket_name = "你的R2桶名"
 
 [vars]
 ADMIN_PASSWORD = "你的管理员密码"
+TURNSTILE_SITE_KEY	= "Turnstile 公开，给前端用"
+TURNSTILE_SECRET_KEY = "Turnstile 保密，只给后端用"
 */
 /*
  * CloudDrive Worker
@@ -65,6 +67,24 @@ async function parsePassword(request) {
     return fd.get('password') || '';
   } catch (e) {
     return '';
+  }
+}
+
+// Turnstile 人机验证：未配置密钥则放行（降级，避免误挡）；验证服务异常也放行（优先可用性）
+async function verifyTurnstile(token, request, env) {
+  if (!env.TURNSTILE_SECRET_KEY) return true;
+  if (!token) return false;
+  const ip = request.headers.get('CF-Connecting-IP') || '';
+  try {
+    const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ secret: env.TURNSTILE_SECRET_KEY, response: token, remoteip: ip })
+    });
+    const data = await resp.json();
+    return !!data.success;
+  } catch (e) {
+    return true; // Cloudflare 验证服务不可用时放行，避免误伤正常下载
   }
 }
 
@@ -867,7 +887,7 @@ async function handleCreateShare(request, env) {
   if (auth.role === 'guest') return jsonResponse({ success: false, message: '游客无权创建分享链接' }, 403);
 
   try {
-    const { filePath, password, expiresIn, shareType, pageName } = await request.json();
+    const { filePath, password, expiresIn, shareType, pageName, turnstile } = await request.json();
     if (!filePath) return jsonResponse({ success: false, message: '请提供文件路径' }, 400);
 
     const key = normalizePath(filePath);
@@ -897,13 +917,15 @@ async function handleCreateShare(request, env) {
           pageName: finalName, filePath: key, fileName: key.split('/').pop(),
           passwordHash: password ? await hashPassword(password) : null,
           expiresAt: getExpirationTime(expiresIn || '1d'),
-          viewCount: 0, createdAt: Date.now()
+          viewCount: 0, createdAt: Date.now(),
+          turnstile: !!turnstile
         }
       : {
           shareId: finalName, filePath: key, fileName: key.split('/').pop(), fileSize: object.size,
           passwordHash: password ? await hashPassword(password) : null,
           expiresAt: getExpirationTime(expiresIn || '1d'),
-          viewCount: 0, downloadCount: 0, createdAt: Date.now()
+          viewCount: 0, downloadCount: 0, createdAt: Date.now(),
+          turnstile: !!turnstile
         };
 
     await env.KV_STORE.put(`${prefix}${finalName}`, JSON.stringify(shareData));
@@ -928,7 +950,8 @@ async function handleGetShareInfo(request, env, shareId) {
     return jsonResponse({
       success: true,       fileName: share.fileName, fileSize: share.fileSize,
       fileSizeFormatted: formatFileSize(share.fileSize),
-      requiresPassword: !!share.passwordHash, expiresAt: share.expiresAt
+      requiresPassword: !!share.passwordHash, expiresAt: share.expiresAt,
+      turnstileSiteKey: (share.turnstile && env.TURNSTILE_SITE_KEY) || ''
     });
   } catch (e) {
     return jsonResponse({ success: false, message: '获取分享信息失败: ' + e.message }, 500);
@@ -945,22 +968,31 @@ async function handleShareDownload(request, env, shareId) {
       return jsonResponse({ success: false, message: '分享链接已过期' }, 410);
     }
 
-    // 解析请求体：body 只能读一次，故在此取出密码
+    // 解析请求体：body 只能读一次，故在此同时取出密码与 Turnstile token
     let password = '';
+    let turnstileToken = '';
     try {
       const ct = request.headers.get('Content-Type') || '';
       if (ct.includes('application/json')) {
         const body = await request.json();
         password = body.password || '';
+        turnstileToken = body.cfTurnstileToken || '';
       } else {
         const fd = await request.formData();
         password = fd.get('password') || '';
+        turnstileToken = fd.get('cf-turnstile-response') || '';
       }
     } catch (e) {}
 
     if (share.passwordHash) {
       if (!password) return jsonResponse({ success: false, message: '请输入密码' }, 401);
       if (await hashPassword(password) !== share.passwordHash) return jsonResponse({ success: false, message: '密码错误' }, 401);
+    }
+
+    // 人机验证（仅当该分享开启了 Turnstile 且配置了密钥时启用，否则放行）
+    if (share.turnstile && env.TURNSTILE_SECRET_KEY) {
+      const ok = await verifyTurnstile(turnstileToken, request, env);
+      if (!ok) return jsonResponse({ success: false, message: '人机验证失败，请重试' }, 403);
     }
 
     const object = await env.R2_BUCKET.get(share.filePath);
@@ -2727,6 +2759,11 @@ const INDEX_PAGE = `
             <option value="permanent">永久有效</option>
           </select>
         </div>
+        <div class="form-group">
+          <label class="form-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" id="shareTurnstile"> 开启人机验证（Turnstile，需已配置密钥；默认关闭）
+          </label>
+        </div>
         <input type="hidden" id="shareFilePath">
         <button type="submit" class="btn btn-primary" style="width: 100%;">创建分享链接</button>
       </form>
@@ -4333,6 +4370,7 @@ sortedFiles.forEach(file => {
       const expiresIn = document.getElementById('shareExpiry').value;
       const shareType = document.getElementById('shareType').value;
       const pageName = document.getElementById('sharePageName').value.trim();
+      const turnstile = document.getElementById('shareTurnstile').checked;
 
       showLoading(true);
       closeModal('shareModal');
@@ -4341,7 +4379,7 @@ sortedFiles.forEach(file => {
         const response = await fetch('/api/share', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filePath, password, expiresIn, shareType, pageName })
+          body: JSON.stringify({ filePath, password, expiresIn, shareType, pageName, turnstile })
         });
 
         const data = await response.json();
@@ -5458,6 +5496,7 @@ const SHARE_PAGE = `
   <script>
     let shareId = '';
     let requiresPassword = false;
+    let turnstileSiteKey = '';
 
     async function loadShareInfo() {
       
@@ -5485,6 +5524,7 @@ const SHARE_PAGE = `
         document.getElementById('fileSize').textContent = data.fileSizeFormatted;
 
         requiresPassword = data.requiresPassword;
+        turnstileSiteKey = data.turnstileSiteKey || '';
         if (requiresPassword) {
           document.getElementById('passwordForm').style.display = 'block';
         }
@@ -5504,6 +5544,39 @@ const SHARE_PAGE = `
       if (requiresPassword && !password) {
         showToast('请输入分享密码', 'error');
         return;
+      }
+
+      // 人机验证（仅当分享页拿到了 Turnstile site key 时启用）
+      let turnstileToken = '';
+      if (turnstileSiteKey) {
+        // 等待 Turnstile 脚本就绪（最多 3s），避免脚本未加载完时误判
+        let tries = 0;
+        while (!window.turnstile && tries < 30) {
+          await new Promise(r => setTimeout(r, 100));
+          tries++;
+        }
+        if (!window.turnstile) {
+          showToast('验证组件加载失败，请刷新页面重试', 'error');
+          return;
+        }
+        try {
+          if (window.tsWidgetId === undefined) {
+            window.tsWidgetId = turnstile.render('ts-hidden', {
+              sitekey: turnstileSiteKey,
+              size: 'invisible',
+              execution: 'execute'
+            });
+          }
+          turnstileToken = await turnstile.execute(window.tsWidgetId, { action: 'download' });
+        } catch (e) {
+          const code = (e && (e.code || e.message)) || e;
+          showToast('人机验证组件错误: ' + code, 'error');
+          return;
+        }
+        if (!turnstileToken) {
+          showToast('人机验证失败（Turnstile 未返回令牌，请检查后台域名/模式）', 'error');
+          return;
+        }
       }
 
       // 直接以表单提交方式触发下载：浏览器边接收边写入磁盘，无需等前端先把整个文件读进内存
@@ -5530,6 +5603,13 @@ const SHARE_PAGE = `
       input.name = 'password';
       input.value = password;
       form.appendChild(input);
+      if (turnstileToken) {
+        const tInput = document.createElement('input');
+        tInput.type = 'hidden';
+        tInput.name = 'cf-turnstile-response';
+        tInput.value = turnstileToken;
+        form.appendChild(tInput);
+      }
       document.body.appendChild(form);
       form.submit();
       document.body.removeChild(form);
@@ -5541,6 +5621,8 @@ const SHARE_PAGE = `
 
     loadShareInfo();
   </script>
+  <div id="ts-hidden" style="position:fixed;left:0;top:0;width:1px;height:1px;overflow:hidden"></div>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async onload="window.tsReady=true"></script>
 </body>
 </html>
 `;
