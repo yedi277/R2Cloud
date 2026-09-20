@@ -121,6 +121,39 @@ function davHeaders(obj, filename) {
   });
 }
 
+// 协商缓存判定：比对 If-None-Match(ETag) / If-Modified-Since，命中返回 true（调用方回 304）
+// 有 If-None-Match 时按 RFC 优先于 If-Modified-Since，不再回退到时间比对
+function notModified(meta, request) {
+  if (!meta) return false;
+  const etag = meta.etag ? `"${meta.etag}"` : (meta.httpEtag || '');
+
+  const inm = request.headers.get('If-None-Match');
+  if (inm) {
+    if (inm.trim() === '*') return true;
+    if (!etag) return false;
+    return inm.split(',').some(v => v.trim().replace(/^W\//, '') === etag);
+  }
+
+  const ims = request.headers.get('If-Modified-Since');
+  if (ims && meta.uploaded) {
+    const since = Date.parse(ims);
+    if (!Number.isNaN(since)) {
+      // HTTP 时间精度只到秒，比对时统一截断到秒，避免亚秒误差导致误判未命中
+      return Math.floor(new Date(meta.uploaded).getTime() / 1000) <= Math.floor(since / 1000);
+    }
+  }
+  return false;
+}
+
+// 构造 304 响应头：只带校验相关字段，不带 body 相关字段
+function notModifiedHeaders(meta) {
+  return {
+    'ETag': meta.etag ? `"${meta.etag}"` : (meta.httpEtag || ''),
+    'Last-Modified': rfc1123Date(meta.uploaded),
+    'Accept-Ranges': 'bytes'
+  };
+}
+
 // 判断 key 是否为「集合」(目录)：存在子对象或子前缀即视为目录
 async function isCollection(env, key) {
   const list = await env.R2_BUCKET.list({ prefix: key + '/', delimiter: '/', limit: 1 });
@@ -192,7 +225,7 @@ async function handleDavPropfind(request, env, davPath) {
   try {
     const depth = request.headers.get('Depth') || 'infinity';
     const baseUrl = new URL(request.url).origin + '/dav/';
-    const fileObj = davPath ? await env.R2_BUCKET.get(davPath) : null;
+    const fileObj = davPath ? await env.R2_BUCKET.head(davPath) : null;  // 取元数据即可，不下载 body（省资源）
     if (fileObj) {
       const name = davPath.split('/').pop();
       const mtime = fileObj.uploaded || new Date();
@@ -287,7 +320,12 @@ async function handleDavGet(request, env, davPath) {
         if (await isCollection(env, key)) return handleDavPropfind(request, env, davPath);
         return new Response('Not Found', { status: 404 });
       }
-      return new Response(obj.body, { status: 200, headers: davHeaders(obj, filename) });
+      const getHeaders = davHeaders(obj, filename);
+      // 协商缓存命中：直接 304，不下行 body
+      if (notModified(obj, request)) {
+        return new Response(null, { status: 304, headers: notModifiedHeaders(obj) });
+      }
+      return new Response(obj.body, { status: 200, headers: getHeaders });
     }
 
     // Range 续传：先 head 取元数据(不下载 body)，再按区间取切片(206)，避免拉整文件
@@ -295,6 +333,10 @@ async function handleDavGet(request, env, davPath) {
     if (!meta) {
       if (await isCollection(env, key)) return handleDavPropfind(request, env, davPath);
       return new Response('Not Found', { status: 404 });
+    }
+    // 协商缓存命中（不带 If-Range 时）：直接 304
+    if (notModified(meta, request) && !request.headers.get('If-Range')) {
+      return new Response(null, { status: 304, headers: notModifiedHeaders(meta) });
     }
     const range = request.headers.get('Range');
     const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());

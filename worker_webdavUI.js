@@ -128,6 +128,39 @@ function davHeaders(obj, filename) {
   });
 }
 
+// 协商缓存判定：比对 If-None-Match(ETag) / If-Modified-Since，命中返回 true（调用方回 304）
+// 有 If-None-Match 时按 RFC 优先于 If-Modified-Since，不再回退到时间比对
+function notModified(meta, request) {
+  if (!meta) return false;
+  const etag = meta.etag ? `"${meta.etag}"` : (meta.httpEtag || '');
+
+  const inm = request.headers.get('If-None-Match');
+  if (inm) {
+    if (inm.trim() === '*') return true;
+    if (!etag) return false;
+    return inm.split(',').some(v => v.trim().replace(/^W\//, '') === etag);
+  }
+
+  const ims = request.headers.get('If-Modified-Since');
+  if (ims && meta.uploaded) {
+    const since = Date.parse(ims);
+    if (!Number.isNaN(since)) {
+      // HTTP 时间精度只到秒，比对时统一截断到秒，避免亚秒误差导致误判未命中
+      return Math.floor(new Date(meta.uploaded).getTime() / 1000) <= Math.floor(since / 1000);
+    }
+  }
+  return false;
+}
+
+// 构造 304 响应头：只带校验相关字段，不带 body 相关字段
+function notModifiedHeaders(meta) {
+  return {
+    'ETag': meta.etag ? `"${meta.etag}"` : (meta.httpEtag || ''),
+    'Last-Modified': rfc1123Date(meta.uploaded),
+    'Accept-Ranges': 'bytes'
+  };
+}
+
 // 判断 key 是否为「集合」(目录)：存在子对象或子前缀即视为目录
 async function isCollection(env, key) {
   const list = await env.R2_BUCKET.list({ prefix: key + '/', delimiter: '/', limit: 1 });
@@ -151,6 +184,31 @@ ${etagLine}        <d:getcontenttype>${xmlEscape(contentType)}</d:getcontenttype
       <d:status>HTTP/1.1 200 OK</d:status>
     </d:propstat>
   </d:response>\n`;
+}
+
+// 列出某前缀下的直接子项（delimiter 分隔一层）：文件对象 + 文件夹名集合
+// handleApiList 与 handleDavPropfind 共用，避免列表逻辑重复
+async function listDir(env, prefix) {
+  const objects = [];
+  const folders = new Set();
+  let cursor;
+  do {
+    const batch = await env.R2_BUCKET.list({ prefix, delimiter: '/', limit: 1000, cursor });
+    if (batch.objects) {
+      for (const obj of batch.objects) {
+        if (obj.key.endsWith('/.keep')) continue;
+        objects.push(obj);
+      }
+    }
+    if (batch.delimitedPrefixes) {
+      for (const dp of batch.delimitedPrefixes) {
+        const name = dp.replace(prefix, '').replace(/\/$/, '');
+        if (name) folders.add(name);
+      }
+    }
+    cursor = batch.truncated ? batch.cursor : null;
+  } while (cursor);
+  return { objects, folders };
 }
 
 async function verifyAuth(request, env) {
@@ -521,25 +579,7 @@ async function handleApiList(request, env) {
 
   try {
     const prefix = reqPath ? reqPath + '/' : '';
-    const objects = [];
-    const folders = new Set();
-    let cursor;
-    do {
-      const batch = await env.R2_BUCKET.list({ prefix, delimiter: '/', limit: 1000, cursor });
-      if (batch.objects) {
-        for (const obj of batch.objects) {
-          if (obj.key.endsWith('/.keep')) continue;
-          objects.push(obj);
-        }
-      }
-      if (batch.delimitedPrefixes) {
-        for (const dp of batch.delimitedPrefixes) {
-          const name = dp.replace(prefix, '').replace(/\/$/, '');
-          if (name) folders.add(name);
-        }
-      }
-      cursor = batch.truncated ? batch.cursor : null;
-    } while (cursor);
+    const { objects, folders } = await listDir(env, prefix);
 
     const files = [];
     for (const name of folders) {
@@ -675,7 +715,7 @@ async function handleDavPropfind(request, env, davPath) {
     const depth = request.headers.get('Depth') || 'infinity';
     const baseUrl = new URL(request.url).origin + '/dav/';
 
-    const fileObj = davPath ? await env.R2_BUCKET.get(davPath) : null;
+    const fileObj = davPath ? await env.R2_BUCKET.head(davPath) : null;  // 取元数据即可，不下载 body（省资源）
     if (fileObj) {
       const name = davPath.split('/').pop();
       const mtime = fileObj.uploaded || new Date();
@@ -693,25 +733,7 @@ async function handleDavPropfind(request, env, davPath) {
     }
 
     const prefix = davPath ? davPath + '/' : '';
-    const objects = [];
-    const folders = new Set();
-    let cursor;
-    do {
-      const batch = await env.R2_BUCKET.list({ prefix, delimiter: '/', limit: 1000, cursor });
-      if (batch.objects) {
-        for (const obj of batch.objects) {
-          if (obj.key.endsWith('/.keep')) continue;
-          objects.push(obj);
-        }
-      }
-      if (batch.delimitedPrefixes) {
-        for (const dp of batch.delimitedPrefixes) {
-          const folderName = dp.replace(prefix, '').replace(/\/$/, '');
-          if (folderName) folders.add(folderName);
-        }
-      }
-      cursor = batch.truncated ? batch.cursor : null;
-    } while (cursor);
+    const { objects, folders } = await listDir(env, prefix);
 
     let xml = '<d:multistatus xmlns:d="DAV:">\n';
     if (depth !== '1') {
@@ -771,7 +793,12 @@ async function handleDavGet(request, env, davPath) {
         if (await isCollection(env, key)) return handleDavPropfind(request, env, davPath);
         return new Response('Not Found', { status: 404 });
       }
-      return new Response(obj.body, { status: 200, headers: davHeaders(obj, filename) });
+      const getHeaders = davHeaders(obj, filename);
+      // 协商缓存命中：直接 304，不下行 body
+      if (notModified(obj, request)) {
+        return new Response(null, { status: 304, headers: notModifiedHeaders(obj) });
+      }
+      return new Response(obj.body, { status: 200, headers: getHeaders });
     }
 
     // Range 续传：先 head 取元数据(不下载 body)，再按区间取切片(206)，避免拉整文件
@@ -779,6 +806,10 @@ async function handleDavGet(request, env, davPath) {
     if (!meta) {
       if (await isCollection(env, key)) return handleDavPropfind(request, env, davPath);
       return new Response('Not Found', { status: 404 });
+    }
+    // 协商缓存命中（不带 If-Range 时）：直接 304
+    if (notModified(meta, request) && !request.headers.get('If-Range')) {
+      return new Response(null, { status: 304, headers: notModifiedHeaders(meta) });
     }
     const range = request.headers.get('Range');
     const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
@@ -1017,13 +1048,51 @@ export default {
         const filePath = normalizePath(url.searchParams.get('path') || '');
         const fileName = url.searchParams.get('name') || '';
         const key = fileName ? filePath + '/' + fileName : filePath;
+        const downloadName = fileName || key.split('/').pop();
+        const disp = 'attachment; filename*=UTF-8\'\'' + encodeURIComponent(downloadName) + '\'';
+
+        // 断点续传：带 Range 时按区间下发 206，不带则整文件下载
+        const range = request.headers.get('Range');
+        if (range) {
+          const meta = await env.R2_BUCKET.head(key);
+          if (!meta) return new Response('Not Found', { status: 404 });
+          const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+          const size = meta.size;
+          if (m) {
+            let start = m[1] === '' ? null : Number(m[1]);
+            let end = m[2] === '' ? null : Number(m[2]);
+            if (start === null && end !== null) { start = Math.max(0, size - end); end = size - 1; }
+            else if (start !== null) {
+              if (end === null) end = size - 1;
+              if (end >= size) end = size - 1;
+              if (start > end) return new Response('Range Not Satisfiable', { status: 416, headers: { 'Content-Range': `bytes */${size}` } });
+            }
+            if (start !== null && end !== null) {
+              const len = end - start + 1;
+              const ranged = await env.R2_BUCKET.get(key, { offset: start, length: len });
+              const headers = new Headers({
+                'Content-Type': meta.httpMetadata?.contentType || getMimeType(key),
+                'Content-Disposition': disp,
+                'Accept-Ranges': 'bytes',
+                'ETag': meta.etag ? `"${meta.etag}"` : (meta.httpEtag || ''),
+                'Last-Modified': rfc1123Date(meta.uploaded),
+                'Content-Length': String(len),
+                'Content-Range': `bytes ${start}-${end}/${size}`,
+              });
+              return new Response(ranged.body, { status: 206, headers });
+            }
+          }
+        }
+
+        // 无 Range 或无法解析：整文件下载
         const obj = await env.R2_BUCKET.get(key);
         if (!obj) return new Response('Not Found', { status: 404 });
         return new Response(obj.body, {
           headers: {
             'Content-Type': obj.httpMetadata?.contentType || getMimeType(key),
-            'Content-Disposition': 'attachment; filename*=UTF-8\'\'' + encodeURIComponent(fileName || key.split('/').pop()) + '\'',
+            'Content-Disposition': disp,
             'Content-Length': obj.size,
+            'Accept-Ranges': 'bytes',
           }
         });
       }

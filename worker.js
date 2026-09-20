@@ -34,6 +34,24 @@ ADMIN_PASSWORD = "你的管理员密码"
  */
 
 /* ============ 1. 工具与鉴权 ============ */
+
+// ---- KV 读取内存缓存（优化项①）----
+// 模块级 Map：在单个 Worker 隔离实例内跨请求共享。
+// 设置/限额类 KV 读极频繁（单 WebDAV 请求可达 4~6 次）但变更极少，
+// 故加短 TTL 缓存：命中即返回，未命中才读 KV；写入时主动失效（见下）。
+const __kvCache = new Map(); // key -> { value, expire }
+const KV_CACHE_TTL = 30 * 1000; // 30 秒
+
+async function kvCachedGet(env, key) {
+  const now = Date.now();
+  const hit = __kvCache.get(key);
+  if (hit && hit.expire > now) return hit.value;
+  const value = await env.KV_STORE.get(key); // 原始字符串
+  __kvCache.set(key, { value, expire: now + KV_CACHE_TTL });
+  return value;
+}
+function kvCacheDelete(key) { __kvCache.delete(key); }
+
 function generateId(length = 16) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let result = '';
@@ -424,18 +442,91 @@ async function deleteR2Folder(env, key) {
   } while (cursor);
   await env.R2_BUCKET.delete(key);
 }
+// 列出目录下的直接子项（cursor 翻页，maxPages 控制翻页上限）
+// 返回 { folders: [文件夹名], objects: [R2Object] }，已过滤目录占位标记 .folder
+async function listDir(env, prefix, maxPages = Infinity) {
+  const folders = [];
+  const objects = [];
+  let cursor = null;
+  let pages = 0;
+  do {
+    const listed = await env.R2_BUCKET.list(cursor ? { prefix, delimiter: '/', cursor } : { prefix, delimiter: '/' });
+    if (listed.delimitedPrefixes) {
+      for (const fp of listed.delimitedPrefixes) {
+        const name = fp.slice(prefix.length, -1);
+        if (name) folders.push(name);
+      }
+    }
+    if (listed.objects) {
+      for (const obj of listed.objects) {
+        const name = obj.key.slice(prefix.length);
+        if (!name || name === '.folder' || name.includes('/')) continue;
+        objects.push(obj);
+      }
+    }
+    cursor = listed.truncated ? listed.cursor : null;
+    pages++;
+  } while (cursor && pages < maxPages);
+  return { folders, objects };
+}
+
+// 统一 ETag 取值：R2 的 etag 不带引号、httpEtag 已带引号，两者混用会产出双引号且口径不一致
+function etagOf(obj) {
+  if (!obj) return '';
+  if (obj.etag) return `"${obj.etag}"`;
+  if (obj.httpEtag) return obj.httpEtag;
+  return `"${obj.uploaded?.getTime?.() || ''}"`;
+}
+
+// 协商缓存判定：比对 If-None-Match(ETag) / If-Modified-Since，命中返回 true（调用方回 304）
+// 有 If-None-Match 时按 RFC 优先于 If-Modified-Since，不再回退到时间比对
+function notModified(meta, request) {
+  if (!meta) return false;
+  const etag = etagOf(meta);
+
+  const inm = request.headers.get('If-None-Match');
+  if (inm) {
+    if (inm.trim() === '*') return true;
+    if (!etag) return false;
+    return inm.split(',').some(v => v.trim().replace(/^W\//, '') === etag);
+  }
+
+  const ims = request.headers.get('If-Modified-Since');
+  if (ims && meta.uploaded) {
+    const since = Date.parse(ims);
+    if (!Number.isNaN(since)) {
+      // HTTP 时间精度只到秒，比对时统一截断到秒，避免亚秒误差导致误判未命中
+      return Math.floor(new Date(meta.uploaded).getTime() / 1000) <= Math.floor(since / 1000);
+    }
+  }
+  return false;
+}
+
+// 构造 304 响应头：只带校验相关字段，不带 body 相关字段
+function notModifiedHeaders(meta) {
+  return {
+    'ETag': etagOf(meta),
+    'Last-Modified': fmtRfc1123(meta.uploaded),
+    'Accept-Ranges': 'bytes'
+  };
+}
+
 async function copyR2Folder(env, srcKey, dstKey) {
+  // 限并发 8、逐组边读边写：原实现纯串行，拷贝/重命名/移动大目录极慢
+  // 又不像整批 Promise.all 那样把整个批次的 body 同时压进内存
+  const CONCURRENCY = 8;
   let cursor;
   do {
     const batch = await env.R2_BUCKET.list({ prefix: srcKey + '/', cursor });
-    if (batch.objects) {
-      for (const obj of batch.objects) {
-        const newKey = dstKey + '/' + obj.key.slice(srcKey.length + 1);
+    const objects = batch.objects || [];
+    for (let i = 0; i < objects.length; i += CONCURRENCY) {
+      const group = objects.slice(i, i + CONCURRENCY);
+      await Promise.all(group.map(async (obj) => {
         const srcFile = await env.R2_BUCKET.get(obj.key);
-        if (srcFile) {
-          await env.R2_BUCKET.put(newKey, srcFile.body, { httpMetadata: srcFile.httpMetadata });
-        }
-      }
+        if (!srcFile) return;
+        const newKey = dstKey + '/' + obj.key.slice(srcKey.length + 1);
+        await env.R2_BUCKET.put(newKey, srcFile.body, { httpMetadata: srcFile.httpMetadata });
+      }));
     }
     cursor = batch.truncated ? batch.cursor : null;
   } while (cursor);
@@ -464,33 +555,28 @@ async function handleListFiles(request, env, path) {
     if (auth.email && auth.role !== 'guest' && (prefix === '' || prefix === '/')) {
       const limits = await getUserLimits(env, auth.email);
       if (limits && limits.allowedFolders && limits.allowedFolders.length > 0) {
-        const allListed = await env.R2_BUCKET.list({ delimiter: '/' });
+        const allListed = await listDir(env, '');
         const allowedSet = new Set(limits.allowedFolders.map(f => normalizeFolder(f)));
 
         const files = [];
         const folders = [];
 
-        if (allListed.delimitedPrefixes) {
-          for (const folderPath of allListed.delimitedPrefixes) {
-            const name = folderPath.slice(0, -1);
-            if (allowedSet.has(name)) {
-              folders.push({ name, path: '/' + name });
-            }
+        for (const name of allListed.folders) {
+          if (allowedSet.has(name)) {
+            folders.push({ name, path: '/' + name });
           }
         }
 
-        if (allListed.objects) {
-          for (const obj of allListed.objects) {
-            const name = obj.key;
-            if (!name.includes('/') && allowedSet.has(name)) {
-              const previewType = getPreviewType(name);
-              files.push({
-                name, path: '/' + obj.key, size: obj.size,
-                sizeFormatted: formatFileSize(obj.size),
-                timeFormatted: formatTime(obj.uploaded.toISOString()),
-                lastModified: obj.uploaded.toISOString(), previewType
-              });
-            }
+        for (const obj of allListed.objects) {
+          const name = obj.key;
+          if (allowedSet.has(name)) {
+            const previewType = getPreviewType(name);
+            files.push({
+              name, path: '/' + obj.key, size: obj.size,
+              sizeFormatted: formatFileSize(obj.size),
+              timeFormatted: formatTime(obj.uploaded.toISOString()),
+              lastModified: obj.uploaded.toISOString(), previewType
+            });
           }
         }
 
@@ -501,36 +587,28 @@ async function handleListFiles(request, env, path) {
     const accessErr = await checkPathAccess(auth, env, prefix.replace(/\/+$/, ''));
     if (accessErr) return accessErr;
 
-    const listed = await env.R2_BUCKET.list({ prefix, delimiter: '/' });
+    // cursor 翻页全量列出：原单次 list 不翻页，目录超过 1000 项时后面的文件会「消失」
+    const listed = await listDir(env, prefix);
 
     const files = [];
     const folders = [];
 
-    if (listed.delimitedPrefixes) {
-      for (const folderPath of listed.delimitedPrefixes) {
-        const name = folderPath.slice(prefix.length, -1);
-        if (name) {
-          folders.push({ name, path: '/' + folderPath.slice(0, -1) });
-        }
-      }
+    for (const name of listed.folders) {
+      folders.push({ name, path: '/' + prefix + name });
     }
 
-    if (listed.objects) {
-      for (const obj of listed.objects) {
-        const name = obj.key.slice(prefix.length);
-        if (name && !name.includes('/')) {
-          const previewType = getPreviewType(name);
-          files.push({
-            name,
-            path: '/' + obj.key,
-            size: obj.size,
-            sizeFormatted: formatFileSize(obj.size),
-            timeFormatted: formatTime(obj.uploaded.toISOString()),
-            lastModified: obj.uploaded.toISOString(),
-            previewType
-          });
-        }
-      }
+    for (const obj of listed.objects) {
+      const name = obj.key.slice(prefix.length);
+      const previewType = getPreviewType(name);
+      files.push({
+        name,
+        path: '/' + obj.key,
+        size: obj.size,
+        sizeFormatted: formatFileSize(obj.size),
+        timeFormatted: formatTime(obj.uploaded.toISOString()),
+        lastModified: obj.uploaded.toISOString(),
+        previewType
+      });
     }
 
     return jsonResponse({ success: true, files, folders, currentPath: '/' + prefix.slice(0, -1) || '/' });
@@ -538,6 +616,9 @@ async function handleListFiles(request, env, path) {
     return jsonResponse({ success: false, message: '获取文件列表失败: ' + e.message }, 500);
   }
 }
+
+const QUICK_SEARCH_PAGES = 10;   // 快速搜索：最多扫 10 页（约 1 万项）
+const SEARCH_MAX_PAGES = 50;     // 全量搜索封顶：50 页（约 5 万项），防止 list 遍全桶耗尽额度
 
 async function handleSearchFiles(request, env) {
   const auth = await requireAuth(request, env);
@@ -552,7 +633,8 @@ async function handleSearchFiles(request, env) {
     const results = [];
     let cursor = undefined;
     let pages = 0;
-    const maxPages = mode === 'full' ? 9999 : 10;
+    // 全量搜索封顶：原先 9999 会在匹配不足 50 条时 list 遍整个桶，请求数与耗时都失控
+    const maxPages = mode === 'full' ? SEARCH_MAX_PAGES : QUICK_SEARCH_PAGES;
     let guestAllowedFolders = null;
     if (auth.role === 'guest') {
       guestAllowedFolders = await getGuestAllowedFolders(env);
@@ -595,8 +677,10 @@ async function handleSearchFiles(request, env) {
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor && pages < maxPages && results.length < 50);
 
+    // truncated=true 表示因页数封顶提前结束，桶里可能还有未扫描的对象
+    const truncated = !!(cursor && pages >= maxPages);
     results.sort((a, b) => a.name.localeCompare(b.name));
-    return jsonResponse({ success: true, results: results.slice(0, 50), mode, scannedPages: pages });
+    return jsonResponse({ success: true, results: results.slice(0, 50), mode, scannedPages: pages, truncated });
   } catch (e) {
     return jsonResponse({ success: false, message: '搜索失败: ' + e.message }, 500);
   }
@@ -665,9 +749,18 @@ async function handleUploadFile(request, env, path) {
   if (auth instanceof Response) return auth;
 
   try {
-    const formData = await request.formData();
-    const file = formData.get('file');
-    if (!file) return jsonResponse({ success: false, message: '没有上传文件' }, 400);
+    // 直传：不解析 multipart，请求体直接流转存 R2，避免整个文件先进内存
+    // 文件名由前端放在 X-File-Name（URL 编码，header 只能放 ASCII）或 ?name= 里
+    const url = new URL(request.url);
+    const rawName = request.headers.get('X-File-Name') || url.searchParams.get('name') || '';
+    let fileName;
+    try { fileName = decodeURIComponent(rawName); } catch (e) { fileName = rawName; }
+    // 只取文件名部分：header 由客户端提供，不清洗会被写到桶的任意路径
+    fileName = String(fileName).split(/[\\/]/).pop() || '';
+    if (!fileName || fileName === '.' || fileName === '..') {
+      return jsonResponse({ success: false, message: '没有上传文件' }, 400);
+    }
+
     const filePathRaw = apiPathToFilePath(path);
     let filePath = normalizePath(filePathRaw);
     if (filePath && !filePath.endsWith('/')) filePath += '/';
@@ -679,14 +772,22 @@ async function handleUploadFile(request, env, path) {
       const accessErr = await checkPathAccess(auth, env, filePath);
       if (accessErr) return accessErr;
     }
+
+    // 流式上传拿不到 file.size，用 Content-Length 做限额（超限直接拒绝，不再读 body）
+    const declaredSize = parseInt(request.headers.get('Content-Length') || '0', 10);
     const maxSize = await getMaxUploadSize(env, auth);
-    if (maxSize > 0 && file.size > maxSize) {
+    if (maxSize > 0 && declaredSize > maxSize) {
       return jsonResponse({ success: false, message: `文件大小超过限制 ${Math.round(maxSize / 1024 / 1024)}MB` }, 400);
     }
 
-    const key = filePath + file.name;
-    await env.R2_BUCKET.put(key, file.stream(), {
-      httpMetadata: { contentType: file.type || getMimeType(file.name) }
+    const key = filePath + fileName;
+    // 直传时 Content-Type 即文件类型；为空或仍是 multipart 时按扩展名推断
+    const declaredType = request.headers.get('Content-Type') || '';
+    const contentType = (declaredType && !declaredType.startsWith('multipart/'))
+      ? declaredType
+      : (getMimeType(fileName) || 'application/octet-stream');
+    await env.R2_BUCKET.put(key, request.body, {
+      httpMetadata: { contentType }
     });
     return jsonResponse({ success: true, message: '文件上传成功', path: '/' + key });
   } catch (e) {
@@ -813,16 +914,66 @@ async function serveFile(request, env, path, { download = false, cache = false }
 
   try {
     let key = normalizePath(apiPathToFilePath(path));
+    const filename = key.split('/').pop();
+    const rangeHeader = request.headers.get('Range');
+
+    // 文件响应头：含 ETag/Last-Modified/Accept-Ranges，供客户端续传与协商缓存
+    const fileHeaders = (obj) => new Headers({
+      'Content-Type': obj.httpMetadata?.contentType || getMimeType(filename) || 'application/octet-stream',
+      'Content-Length': String(obj.size),
+      'ETag': etagOf(obj),
+      'Last-Modified': fmtRfc1123(obj.uploaded),
+      'Accept-Ranges': 'bytes'
+    });
+
+    // 只有在带 Range / 条件请求时才先 head 取元数据：普通请求仍保持 1 次 get，不浪费 R2 操作
+    const conditional = !!(rangeHeader || request.headers.get('If-None-Match') || request.headers.get('If-Modified-Since'));
+    let meta = null;
+    if (conditional) {
+      meta = await env.R2_BUCKET.head(key);
+      if (!meta) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+      // 缓存仍有效：不下行 body
+      if (!rangeHeader && notModified(meta, request)) {
+        return new Response(null, { status: 304, headers: notModifiedHeaders(meta) });
+      }
+    }
+
+    // Range 续传：只取请求区间，浏览器靠它 seek（视频/音频拖动进度条）
+    if (rangeHeader && meta && meta.size > 0) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+      if (m) {
+        const size = meta.size;
+        let start, end;
+        if (m[1] === '') {
+          const suffix = m[2] === '' ? size : Number(m[2]);   // bytes=-N：取末尾 N 字节
+          start = Math.max(0, size - suffix);
+          end = size - 1;
+        } else {
+          start = Number(m[1]);
+          end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
+        }
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) {
+          const rh = fileHeaders(meta);
+          rh.set('Content-Range', `bytes */${size}`);
+          return new Response('Range Not Satisfiable', { status: 416, headers: rh });
+        }
+        const slice = await env.R2_BUCKET.get(key, { offset: start, length: end - start + 1 });
+        if (!slice) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+        const rh = fileHeaders(meta);
+        rh.set('Content-Range', `bytes ${start}-${end}/${size}`);
+        rh.set('Content-Length', String(end - start + 1));
+        if (download) rh.set('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+        if (cache) rh.set('Cache-Control', 'private, max-age=3600');
+        return new Response(slice.body, { status: 206, headers: rh });
+      }
+    }
+
     const object = await env.R2_BUCKET.get(key);
     if (!object) return jsonResponse({ success: false, message: '文件不存在' }, 404);
 
-    const filename = key.split('/').pop();
-    const headers = {
-      'Content-Type': object.httpMetadata?.contentType || getMimeType(filename),
-      'Content-Length': object.size
-    };
-    if (download) headers['Content-Disposition'] = `attachment; filename="${encodeURIComponent(filename)}"`;
-    if (cache) headers['Cache-Control'] = 'private, max-age=3600';
+    const headers = fileHeaders(object);
+    if (download) headers.set('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+    if (cache) headers.set('Cache-Control', 'private, max-age=3600');
     return new Response(object.body, { headers });
   } catch (e) {
     return jsonResponse({ success: false, message: (download ? '下载' : '预览') + '失败: ' + e.message }, 500);
@@ -963,20 +1114,63 @@ async function handleShareDownload(request, env, shareId) {
       if (await hashPassword(password) !== share.passwordHash) return jsonResponse({ success: false, message: '密码错误' }, 401);
     }
 
-    const object = await env.R2_BUCKET.get(share.filePath);
-    if (!object) return jsonResponse({ success: false, message: '文件不存在' }, 404);
-
-    share.downloadCount++;
-    await env.KV_STORE.put(`share:${shareId}`, JSON.stringify(share));
-    await incrementStat(env, 'stats:totalDownloads');
-
-    return new Response(object.body, {
-      headers: {
-        'Content-Type': object.httpMetadata?.contentType || getMimeType(share.fileName),
-        'Content-Disposition': `attachment; filename="${encodeURIComponent(share.fileName)}"`,
-        'Content-Length': object.size
-      }
+    // 分享下载响应头：带 Accept-Ranges/ETag，支持断点续传
+    const shareHeaders = (obj) => new Headers({
+      'Content-Type': obj.httpMetadata?.contentType || getMimeType(share.fileName),
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(share.fileName)}"`,
+      'Content-Length': String(obj.size),
+      'ETag': etagOf(obj),
+      'Last-Modified': fmtRfc1123(obj.uploaded),
+      'Accept-Ranges': 'bytes'
     });
+
+    const rangeHeader = request.headers.get('Range');
+    let result = null;
+
+    // Range 续传：先 head 取总长，再按区间取切片（206），不拉整文件
+    if (rangeHeader) {
+      const meta = await env.R2_BUCKET.head(share.filePath);
+      if (!meta) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+      const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+      const size = meta.size;
+      if (m && size > 0) {
+        let start, end;
+        if (m[1] === '') {
+          const suffix = m[2] === '' ? size : Number(m[2]);   // bytes=-N：取末尾 N 字节
+          start = Math.max(0, size - suffix);
+          end = size - 1;
+        } else {
+          start = Number(m[1]);
+          end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
+        }
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) {
+          const rh = shareHeaders(meta);
+          rh.set('Content-Range', `bytes */${size}`);
+          result = new Response('Range Not Satisfiable', { status: 416, headers: rh });
+        } else {
+          const slice = await env.R2_BUCKET.get(share.filePath, { offset: start, length: end - start + 1 });
+          if (!slice) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+          const rh = shareHeaders(meta);
+          rh.set('Content-Range', `bytes ${start}-${end}/${size}`);
+          rh.set('Content-Length', String(end - start + 1));
+          result = new Response(slice.body, { status: 206, headers: rh });
+        }
+      }
+    }
+
+    if (!result) {
+      const object = await env.R2_BUCKET.get(share.filePath);
+      if (!object) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+      result = new Response(object.body, { headers: shareHeaders(object) });
+    }
+
+    // 416（区间越界）不算成功下载，不计数
+    if (result.status !== 416) {
+      share.downloadCount++;
+      await env.KV_STORE.put(`share:${shareId}`, JSON.stringify(share));
+      await incrementStat(env, 'stats:totalDownloads');
+    }
+    return result;
   } catch (e) {
     return jsonResponse({ success: false, message: '下载失败: ' + e.message }, 500);
   }
@@ -999,7 +1193,7 @@ async function handleGetStats(request, env) {
 const DEFAULT_SETTINGS = { guestLogin: true, maxUploadSize: 0, webdavEnabled: true, webdavReadOnly: false };
 
 async function getGlobalSettings(env) {
-  const raw = await env.KV_STORE.get('settings:global');
+  const raw = await kvCachedGet(env, 'settings:global');
   if (!raw) return { ...DEFAULT_SETTINGS };
   try { return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) }; } catch { return { ...DEFAULT_SETTINGS }; }
 }
@@ -1022,6 +1216,7 @@ async function handleUpdateSettings(request, env) {
     if (typeof webdavEnabled === 'boolean') updated.webdavEnabled = webdavEnabled;
     if (typeof webdavReadOnly === 'boolean') updated.webdavReadOnly = webdavReadOnly;
     await env.KV_STORE.put('settings:global', JSON.stringify(updated));
+    kvCacheDelete('settings:global');
     return jsonResponse({ success: true, settings: updated, message: '设置已更新' });
   } catch (e) {
     return jsonResponse({ success: false, message: '更新设置失败: ' + e.message }, 500);
@@ -1032,7 +1227,7 @@ const DEFAULT_USER_LIMITS = { role: 'user', maxUploadSize: 0, allowedFolders: []
 
 async function getUserLimits(env, email) {
   try {
-    const raw = await env.KV_STORE.get(`settings:user:${email}`);
+    const raw = await kvCachedGet(env, `settings:user:${email}`);
     return raw ? { ...DEFAULT_USER_LIMITS, ...JSON.parse(raw) } : null;
   } catch { return null; }
 }
@@ -1060,6 +1255,7 @@ async function handleUpdateUserSettings(request, env, email) {
     if (typeof webdavEnabled === 'boolean') existing.webdavEnabled = webdavEnabled;
     if (typeof webdavReadOnly === 'boolean') existing.webdavReadOnly = webdavReadOnly;
     await env.KV_STORE.put(`settings:user:${email}`, JSON.stringify(existing));
+    kvCacheDelete(`settings:user:${email}`);
     return jsonResponse({ success: true, limits: existing, message: '用户权限已更新' });
   } catch (e) {
     return jsonResponse({ success: false, message: '更新用户设置失败: ' + e.message }, 500);
@@ -1281,7 +1477,7 @@ async function handleDavPropfind(request, env, davPath, depth, auth) {
         `<D:getcontentlength>${fileObj.size}</D:getcontentlength>`,
         `<D:getlastmodified>${fmtRfc1123(fileObj.uploaded)}</D:getlastmodified>`,
         `<D:getcontenttype>${fileObj.httpMetadata?.contentType || getMimeType(key.split('/').pop())}</D:getcontenttype>`,
-        `<D:getetag>"${fileObj.httpEtag || fileObj.uploaded.getTime()}"</D:getetag>`
+        `<D:getetag>${davXmlEsc(etagOf(fileObj))}</D:getetag>`
       ].join('');
       responses.push(buildPropstat(currentHref, props, 200));
     } else {
@@ -1292,36 +1488,23 @@ async function handleDavPropfind(request, env, davPath, depth, auth) {
       responses.push(buildPropstat(currentHrefSlash, folderProps, 200));
       if (depth !== '0') {
         // 翻页拉取直接子项，封顶 10 页(~1万项)防止极端目录拖垮请求
-        let cursor = null, pages = 0;
-        const MAX_PAGES = 10;
-        do {
-          const listed = await env.R2_BUCKET.list(cursor ? { prefix, delimiter: '/', cursor } : { prefix, delimiter: '/' });
-          if (listed.delimitedPrefixes) {
-            for (const fp of listed.delimitedPrefixes) {
-              const name = fp.slice(prefix.length, -1);
-              if (!name) continue;
-              const childHref = currentHrefSlash + name + '/';
-              responses.push(buildPropstat(childHref, folderProps, 200));
-            }
-          }
-          if (listed.objects) {
-            for (const obj of listed.objects) {
-              const name = obj.key.slice(prefix.length);
-              if (!name || name === '.folder' || name.includes('/')) continue;
-              const childHref = currentHrefSlash + name;
-              const childProps = [
-                '<D:resourcetype/>',
-                `<D:getcontentlength>${obj.size}</D:getcontentlength>`,
-                `<D:getlastmodified>${fmtRfc1123(obj.uploaded)}</D:getlastmodified>`,
-                `<D:getcontenttype>${obj.httpMetadata?.contentType || getMimeType(name)}</D:getcontenttype>`,
-                `<D:getetag>"${obj.etag || obj.uploaded.getTime()}"</D:getetag>`
-              ].join('');
-              responses.push(buildPropstat(childHref, childProps, 200));
-            }
-          }
-          cursor = listed.truncated ? listed.cursor : null;
-          pages++;
-        } while (cursor && pages < MAX_PAGES);
+        const listed = await listDir(env, prefix, 10);
+        for (const name of listed.folders) {
+          const childHref = currentHrefSlash + name + '/';
+          responses.push(buildPropstat(childHref, folderProps, 200));
+        }
+        for (const obj of listed.objects) {
+          const name = obj.key.slice(prefix.length);
+          const childHref = currentHrefSlash + name;
+          const childProps = [
+            '<D:resourcetype/>',
+            `<D:getcontentlength>${obj.size}</D:getcontentlength>`,
+            `<D:getlastmodified>${fmtRfc1123(obj.uploaded)}</D:getlastmodified>`,
+            `<D:getcontenttype>${obj.httpMetadata?.contentType || getMimeType(name)}</D:getcontenttype>`,
+            `<D:getetag>${davXmlEsc(etagOf(obj))}</D:getetag>`
+          ].join('');
+          responses.push(buildPropstat(childHref, childProps, 200));
+        }
       }
     }
   } catch (e) { /* fall through */ }
@@ -1336,7 +1519,7 @@ function davHeaders(obj, filename) {
   return new Headers({
     'Content-Type': obj.httpMetadata?.contentType || getMimeType(filename),
     'Content-Length': obj.size,
-    'ETag': `"${obj.httpEtag || obj.uploaded?.getTime() || ''}"`,
+    'ETag': etagOf(obj),
     'Last-Modified': fmtRfc1123(obj.uploaded),
     'Cache-Control': 'no-cache',
     'Accept-Ranges': 'bytes'
@@ -1353,6 +1536,10 @@ async function handleDavGet(request, env, davPath, auth) {
   if (isHead) {
     const meta = await env.R2_BUCKET.head(key);
     if (!meta) return new Response('Not Found', { status: 404 });
+    // 协商缓存命中：直接 304
+    if (notModified(meta, request)) {
+      return new Response(null, { status: 304, headers: notModifiedHeaders(meta) });
+    }
     return new Response(null, { status: 200, headers: davHeaders(meta, filename) });
   }
 
@@ -1361,6 +1548,10 @@ async function handleDavGet(request, env, davPath, auth) {
   if (range) {
     const meta = await env.R2_BUCKET.head(key);
     if (!meta) return new Response('Not Found', { status: 404 });
+    // 客户端缓存仍有效且未要求重取整个区间：回 304，不下行 body
+    if (notModified(meta, request) && !request.headers.get('If-Range')) {
+      return new Response(null, { status: 304, headers: notModifiedHeaders(meta) });
+    }
     const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
     const size = meta.size;
     if (m) {
@@ -1386,6 +1577,10 @@ async function handleDavGet(request, env, davPath, auth) {
   // 整文件下载
   const object = await env.R2_BUCKET.get(key);
   if (!object) return new Response('Not Found', { status: 404 });
+  // 协商缓存命中：直接 304，不下行 body
+  if (notModified(object, request)) {
+    return new Response(null, { status: 304, headers: notModifiedHeaders(object) });
+  }
   return new Response(object.body, { status: 200, headers: davHeaders(object, filename) });
 }
 
@@ -4083,10 +4278,11 @@ sortedFiles.forEach(file => {
             resolve();
           });
           xhr.addEventListener('error', () => { failCount++; resolve(); });
+          // 直传：不再用 FormData（大文件不再整体进内存），文件名走 header
           xhr.open('POST', '/api/files' + currentPath);
-          const fd = new FormData();
-          fd.append('file', file);
-          xhr.send(fd);
+          xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+          if (file.type) xhr.setRequestHeader('Content-Type', file.type);
+          xhr.send(file);
         });
       }
       if (smallFiles.length > 0) {
@@ -4104,10 +4300,11 @@ sortedFiles.forEach(file => {
               resolve();
             });
             xhr.addEventListener('error', () => { failCount++; resolve(); });
+            // 直传：同上，文件名走 header
             xhr.open('POST', '/api/files' + currentPath);
-            const fd = new FormData();
-            fd.append('file', file);
-            xhr.send(fd);
+            xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+            if (file.type) xhr.setRequestHeader('Content-Type', file.type);
+            xhr.send(file);
           });
         }));
       }
@@ -5597,13 +5794,20 @@ function buildPagePasswordPage(pageName, errorMsg) {
 </html>`;
 }
 
-async function servePageContent(page, env) {
+async function servePageContent(page, env, ctx) {
   const object = await env.R2_BUCKET.get(page.filePath);
   if (!object) return htmlResponse(PAGE_NOT_FOUND_PAGE, 404);
 
   page.viewCount = (page.viewCount || 0) + 1;
-  await env.KV_STORE.put(`page:${page.pageName}`, JSON.stringify(page));
-  await incrementStat(env, 'stats:totalViews');
+  // 优化项②：浏览计数与统计写入改为后台异步，不阻塞分享页响应
+  const persist = (async () => {
+    try {
+      await env.KV_STORE.put(`page:${page.pageName}`, JSON.stringify(page));
+      await incrementStat(env, 'stats:totalViews');
+    } catch (e) { /* 后台写入失败不影响页面展示 */ }
+  })();
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(persist);
+  else await persist; // 极端情况无 ctx 时回退为同步，保证不丢计数
 
   return new Response(object.body, {
     headers: {
@@ -5615,7 +5819,7 @@ async function servePageContent(page, env) {
   });
 }
 
-async function handlePageView(request, env, pageName) {
+async function handlePageView(request, env, pageName, ctx) {
   const raw = await env.KV_STORE.get(`page:${pageName}`);
   if (!raw) return htmlResponse(PAGE_NOT_FOUND_PAGE, 404);
   const page = JSON.parse(raw);
@@ -5627,12 +5831,12 @@ async function handlePageView(request, env, pageName) {
       if (!password || await hashPassword(password) !== page.passwordHash) {
         return htmlResponse(buildPagePasswordPage(pageName, '密码错误'), 401);
       }
-      return await servePageContent(page, env);
+      return await servePageContent(page, env, ctx);
     }
     return htmlResponse(buildPagePasswordPage(pageName, ''));
   }
 
-  return await servePageContent(page, env);
+  return await servePageContent(page, env, ctx);
 }
 
 /* ============ 10. 路由（请求入口） ============ */
@@ -5797,7 +6001,7 @@ export default {
       if (path.startsWith('/p/')) {
         const pageName = decodeURIComponent(path.slice('/p/'.length));
         if (!pageName) return htmlResponse(PAGE_NOT_FOUND_PAGE, 404);
-        return await handlePageView(request, env, pageName);
+        return await handlePageView(request, env, pageName, ctx);
       }
 
       if (path === '/login.html' || path === '/login') {

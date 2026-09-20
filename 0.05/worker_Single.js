@@ -182,22 +182,21 @@ async function deleteR2Folder(env, key) {
   await env.R2_BUCKET.delete(key);
 }
 
-async function copyR2Folder(env, srcKey, dstKey) {
+async function copyR2Folder(env, srcKey, dstKey, concurrency = 8) {
   let cursor;
   do {
     const batch = await env.R2_BUCKET.list({ prefix: srcKey + '/', cursor });
     if (batch.objects?.length) {
-      const srcObjects = await Promise.all(
-        batch.objects.map(obj => env.R2_BUCKET.get(obj.key))
-      );
-      await Promise.all(
-        batch.objects.map((obj, i) => {
-          const srcObj = srcObjects[i];
-          if (!srcObj) return Promise.resolve();
+      // 限并发逐对象拷贝：边读边写，避免整批 body 同时载入内存导致 OOM
+      for (let i = 0; i < batch.objects.length; i += concurrency) {
+        const slice = batch.objects.slice(i, i + concurrency);
+        await Promise.all(slice.map(async (obj) => {
           const newKey = dstKey + obj.key.slice(srcKey.length);
-          return env.R2_BUCKET.put(newKey, srcObj.body, { httpMetadata: srcObj.httpMetadata });
-        })
-      );
+          const srcObj = await env.R2_BUCKET.get(obj.key);
+          if (!srcObj) return;
+          await env.R2_BUCKET.put(newKey, srcObj.body, { httpMetadata: srcObj.httpMetadata });
+        }));
+      }
     }
     cursor = batch.truncated ? batch.cursor : null;
   } while (cursor);
@@ -259,6 +258,34 @@ function normalizePath(p) {
   return p;
 }
 
+// 列出某前缀下的直接子项（delimiter 分隔一层）：文件对象 + 文件夹名集合
+// handleListFiles 与 handleDavPropfind 共用；带 cursor 翻页，避免目录 >1000 项时被截断
+// maxPages 可限制翻页次数（PROPFIND 传 10 封顶，列表页不传则全部列出）
+async function listDir(env, prefix, maxPages = Infinity) {
+  const objects = [];
+  const folders = new Set();
+  let cursor;
+  let pages = 0;
+  do {
+    const batch = await env.R2_BUCKET.list({ prefix, delimiter: '/', limit: 1000, cursor });
+    if (batch.objects) {
+      for (const obj of batch.objects) {
+        if (obj.key.endsWith('/.keep') || obj.key.endsWith('/.folder')) continue;
+        objects.push(obj);
+      }
+    }
+    if (batch.delimitedPrefixes) {
+      for (const dp of batch.delimitedPrefixes) {
+        const name = dp.slice(prefix.length).replace(/\/$/, '');
+        if (name) folders.add(name);
+      }
+    }
+    cursor = batch.truncated ? batch.cursor : null;
+    pages++;
+  } while (cursor && pages < maxPages);
+  return { objects, folders };
+}
+
 
 async function handleListFiles(request, env, path) {
   const auth = await requireAuth(request, env);
@@ -268,35 +295,29 @@ async function handleListFiles(request, env, path) {
     let prefix = normalizePath(path);
     if (prefix && !prefix.endsWith('/')) prefix += '/';
 
-    const listed = await env.R2_BUCKET.list({ prefix, delimiter: '/' });
+    // 翻页列出全部子项（原单次 list 不翻页，目录 >1000 项时会截断）
+    const { objects, folders: folderNames } = await listDir(env, prefix);
 
     const files = [];
     const folders = [];
 
-    if (listed.delimitedPrefixes) {
-      for (const folderPath of listed.delimitedPrefixes) {
-        const name = folderPath.slice(prefix.length, -1);
-        if (name) {
-          folders.push({ name, path: '/' + folderPath.slice(0, -1) });
-        }
-      }
+    for (const name of folderNames) {
+      folders.push({ name, path: '/' + prefix + name });
     }
 
-    if (listed.objects) {
-      for (const obj of listed.objects) {
-        const name = obj.key.slice(prefix.length);
-        if (name && !name.includes('/')) {
-          const previewType = getPreviewType(name);
-          files.push({
-            name,
-            path: '/' + obj.key,
-            size: obj.size,
-            sizeFormatted: formatFileSize(obj.size),
-            timeFormatted: formatTime(obj.uploaded.toISOString()),
-            lastModified: obj.uploaded.toISOString(),
-            previewType
-          });
-        }
+    for (const obj of objects) {
+      const name = obj.key.slice(prefix.length);
+      if (name && !name.includes('/')) {
+        const previewType = getPreviewType(name);
+        files.push({
+          name,
+          path: '/' + obj.key,
+          size: obj.size,
+          sizeFormatted: formatFileSize(obj.size),
+          timeFormatted: formatTime(obj.uploaded.toISOString()),
+          lastModified: obj.uploaded.toISOString(),
+          previewType
+        });
       }
     }
 
@@ -305,6 +326,9 @@ async function handleListFiles(request, env, path) {
     return jsonResponse({ success: false, message: '获取文件列表失败: ' + e.message }, 500);
   }
 }
+
+const QUICK_SEARCH_PAGES = 10;   // 快速搜索：最多扫 10 页（约 1 万项）
+const SEARCH_MAX_PAGES = 50;     // 全量搜索封顶：50 页（约 5 万项），防止 list 遍全桶耗尽额度
 
 async function handleSearchFiles(request, env) {
   const auth = await requireAuth(request, env);
@@ -319,7 +343,9 @@ async function handleSearchFiles(request, env) {
     const results = [];
     let cursor = undefined;
     let pages = 0;
-    const maxPages = mode === 'full' ? 9999 : 10;
+    // 全量搜索封顶：最多扫 50 页（约 5 万项）。原先 9999 会在匹配不足 50 条时
+    // list 遍整个桶，请求数与耗时都失控；封顶后通过 truncated 告知前端「未扫完」
+    const maxPages = mode === 'full' ? SEARCH_MAX_PAGES : QUICK_SEARCH_PAGES;
 
     do {
       pages++;
@@ -348,8 +374,10 @@ async function handleSearchFiles(request, env) {
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor && pages < maxPages && results.length < 50);
 
+    // truncated=true 表示因页数封顶提前结束，桶里可能还有未扫描的对象
+    const truncated = !!(cursor && pages >= maxPages);
     results.sort((a, b) => a.name.localeCompare(b.name));
-    return jsonResponse({ success: true, results: results.slice(0, 50), mode, scannedPages: pages });
+    return jsonResponse({ success: true, results: results.slice(0, 50), mode, scannedPages: pages, truncated });
   } catch (e) {
     return jsonResponse({ success: false, message: '搜索失败: ' + e.message }, 500);
   }
@@ -398,16 +426,26 @@ async function handleUploadFile(request, env, path) {
   if (auth instanceof Response) return auth;
 
   try {
-    const formData = await request.formData();
-    const file = formData.get('file');
-    if (!file) return jsonResponse({ success: false, message: '没有上传文件' }, 400);
+    // 文件名优先取 X-File-Name（前端直传 body 流），兼容旧端 ?name=
+    const nameHeader = request.headers.get('X-File-Name');
+    const fileNameRaw = nameHeader
+      ? decodeURIComponent(nameHeader)
+      : (new URL(request.url).searchParams.get('name') || '');
+    // 防穿越：只取 basename，拒绝 . / ..
+    const fileName = (fileNameRaw || '').split(/[\\/]/).pop();
+    if (!fileName || fileName === '.' || fileName === '..') {
+      return jsonResponse({ success: false, message: '文件名无效' }, 400);
+    }
 
     let filePath = normalizePath(path);
     if (filePath && !filePath.endsWith('/')) filePath += '/';
 
-    const key = filePath + file.name;
-    await env.R2_BUCKET.put(key, file.stream(), {
-      httpMetadata: { contentType: file.type || getMimeType(file.name) }
+    const key = filePath + fileName;
+    // 直传请求体流，内存占用从「整个文件」降到接近 0；Content-Type 取请求头(排除 multipart)，为空按扩展名推断
+    const ctype = request.headers.get('Content-Type');
+    const contentType = (ctype && !ctype.includes('multipart')) ? ctype : getMimeType(fileName);
+    await env.R2_BUCKET.put(key, request.body, {
+      httpMetadata: { contentType }
     });
     return jsonResponse({ success: true, message: '文件上传成功', path: '/' + key });
   } catch (e) {
@@ -514,16 +552,66 @@ async function serveFile(request, env, path, { download = false, cache = false }
 
   try {
     let key = normalizePath(path);
+    const filename = key.split('/').pop();
+    const rangeHeader = request.headers.get('Range');
+
+    // 文件响应头：含 ETag/Last-Modified/Accept-Ranges，供客户端续传与协商缓存
+    const fileHeaders = (obj) => new Headers({
+      'Content-Type': obj.httpMetadata?.contentType || getMimeType(filename) || 'application/octet-stream',
+      'Content-Length': String(obj.size),
+      'ETag': obj.etag ? `"${obj.etag}"` : (obj.httpEtag || ''),
+      'Last-Modified': rfc1123Date(obj.uploaded),
+      'Accept-Ranges': 'bytes'
+    });
+
+    // 只有在带 Range / 条件请求时才先 head 取元数据：普通请求仍保持 1 次 get，不浪费 R2 操作
+    const conditional = !!(rangeHeader || request.headers.get('If-None-Match') || request.headers.get('If-Modified-Since'));
+    let meta = null;
+    if (conditional) {
+      meta = await env.R2_BUCKET.head(key);
+      if (!meta) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+      // 缓存仍有效：不下行 body
+      if (!rangeHeader && notModified(meta, request)) {
+        return new Response(null, { status: 304, headers: notModifiedHeaders(meta) });
+      }
+    }
+
+    // Range 续传：只取请求区间，浏览器靠它 seek（视频/音频拖动进度条）
+    if (rangeHeader && meta && meta.size > 0) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+      if (m) {
+        const size = meta.size;
+        let start, end;
+        if (m[1] === '') {
+          const suffix = m[2] === '' ? size : Number(m[2]);   // bytes=-N：取末尾 N 字节
+          start = Math.max(0, size - suffix);
+          end = size - 1;
+        } else {
+          start = Number(m[1]);
+          end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
+        }
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) {
+          const rh = fileHeaders(meta);
+          rh.set('Content-Range', `bytes */${size}`);
+          return new Response('Range Not Satisfiable', { status: 416, headers: rh });
+        }
+        const slice = await env.R2_BUCKET.get(key, { offset: start, length: end - start + 1 });
+        if (!slice) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+        const rh = fileHeaders(meta);
+        rh.set('Content-Range', `bytes ${start}-${end}/${size}`);
+        rh.set('Content-Length', String(end - start + 1));
+        if (download) rh.set('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+        if (cache) rh.set('Cache-Control', 'private, max-age=3600');
+        return new Response(slice.body, { status: 206, headers: rh });
+      }
+    }
+
     const object = await env.R2_BUCKET.get(key);
     if (!object) return jsonResponse({ success: false, message: '文件不存在' }, 404);
 
-    const filename = key.split('/').pop();
-    const headers = {
-      'Content-Type': object.httpMetadata?.contentType || getMimeType(filename),
-      'Content-Length': object.size
-    };
-    if (download) headers['Content-Disposition'] = `attachment; filename="${encodeURIComponent(filename)}"`;
-    if (cache) headers['Cache-Control'] = 'private, max-age=3600';
+    const headers = fileHeaders(object);
+    if (download) headers.set('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+    if (cache) headers.set('Cache-Control', 'private, max-age=3600');
     return new Response(object.body, { headers });
   } catch (e) {
     return jsonResponse({ success: false, message: (download ? '下载' : '预览') + '失败: ' + e.message }, 500);
@@ -576,12 +664,13 @@ function crc32Table() {
 }
 const CRC32_TABLE = crc32Table();
 
-function crc32(data) {
-  let crc = 0xFFFFFFFF;
+// 增量 CRC32：流式打包时逐块累积，避免把整个文件读进内存算校验和
+function crc32Update(crc, data) {
+  let c = (crc ^ 0xFFFFFFFF) >>> 0;
   for (let i = 0; i < data.length; i++) {
-    crc = CRC32_TABLE[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+    c = CRC32_TABLE[(c ^ data[i]) & 0xFF] ^ (c >>> 8);
   }
-  return (crc ^ 0xFFFFFFFF) >>> 0;
+  return (c ^ 0xFFFFFFFF) >>> 0;
 }
 
 // 递归收集 R2 中所有文件（含子文件夹），计算 ZIP 内相对路径
@@ -603,94 +692,115 @@ async function collectR2Files(env, prefix, relativePrefix, allFiles) {
   } while (cursor);
 }
 
-// 手动生成 ZIP 文件（Stored 无压缩，纯 JS，无依赖）
+// 流式生成 ZIP（Stored 无压缩，纯 JS，无依赖）
+// 逐个文件边读边写、增量算 CRC，整包不驻留内存，避免大目录打包时 OOM
+// 用 data descriptor（general flag bit 3）：local header 先写，crc/size 跟在数据后
 // files: [{ key, relativePath, size }]
-async function generateZip(files, env) {
+function generateZipStream(files, env) {
   const encoder = new TextEncoder();
-  const parts = [];          // 所有 Uint8Array 片段
-  let currentOffset = 0;     // 当前写偏移（用于中央目录）
-  const centralEntries = []; // { filename, crc, size, offset }
+  const centralEntries = []; // { filenameBytes, crc, size, offset }
+  let currentOffset = 0;
 
-  for (const file of files) {
-    const obj = await env.R2_BUCKET.get(file.key);
-    if (!obj) continue;
+  return new ReadableStream({
+    async start(controller) {
+      try {
+        for (const file of files) {
+          const obj = await env.R2_BUCKET.get(file.key);
+          if (!obj) continue;
 
-    const data = new Uint8Array(await obj.arrayBuffer());
-    const crc = crc32(data);
-    const filenameBytes = encoder.encode(file.relativePath);
-    const headerLen = 30 + filenameBytes.length;
+          const filenameBytes = encoder.encode(file.relativePath);
+          const headerLen = 30 + filenameBytes.length;
 
-    // ── Local file header ──
-    const header = new Uint8Array(headerLen);
-    const h = new DataView(header.buffer);
-    h.setUint32(0,  0x04034b50, true); // signature
-    h.setUint16(4,  20,        true); // version needed
-    h.setUint16(6,  0x0800,   true); // general flag (UTF-8)
-    h.setUint16(8,  0,         true); // compression method (stored)
-    h.setUint16(10, 0,         true); // last mod time
-    h.setUint16(12, 0,         true); // last mod date
-    h.setUint32(14, crc,       true);
-    h.setUint32(18, data.length, true); // compressed size
-    h.setUint32(22, data.length, true); // uncompressed size
-    h.setUint16(26, filenameBytes.length, true);
-    h.setUint16(28, 0, true); // extra field length
-    header.set(filenameBytes, 30);
+          // ── Local file header ──
+          const header = new Uint8Array(headerLen);
+          const h = new DataView(header.buffer);
+          h.setUint32(0,  0x04034b50, true); // signature
+          h.setUint16(4,  20,        true); // version needed
+          h.setUint16(6,  0x0800 | 0x08, true); // UTF-8 + data descriptor
+          h.setUint16(8,  0,         true); // compression method (stored)
+          h.setUint16(10, 0,         true); // last mod time
+          h.setUint16(12, 0,         true); // last mod date
+          h.setUint32(14, 0,         true); // crc（data descriptor 提供）
+          h.setUint32(18, 0,         true); // compressed size
+          h.setUint32(22, 0,         true); // uncompressed size
+          h.setUint16(26, filenameBytes.length, true);
+          h.setUint16(28, 0,         true); // extra field length
+          header.set(filenameBytes, 30);
+          controller.enqueue(header);
 
-    parts.push(header);
-    parts.push(data);
-    centralEntries.push({ filenameBytes, crc, size: data.length, offset: currentOffset });
-    currentOffset += headerLen + data.length;
-  }
+          // 边读边算 CRC、边把数据推给客户端（内存里只保留单个分块）
+          let crc = 0;
+          let size = 0;
+          const reader = obj.body.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+            crc = crc32Update(crc, chunk);
+            size += chunk.length;
+            controller.enqueue(chunk);
+          }
 
-  // ── Central directory ──
-  const cdParts = [];
-  let cdSize = 0;
-  for (const entry of centralEntries) {
-    const entryLen = 46 + entry.filenameBytes.length;
-    const buf = new Uint8Array(entryLen);
-    const v = new DataView(buf.buffer);
-    v.setUint32(0,  0x02014b50, true); // signature
-    v.setUint16(4,  20,        true); // version made by
-    v.setUint16(6,  20,        true); // version needed
-    v.setUint16(8,  0x0800,   true); // general flag (UTF-8)
-    v.setUint16(10, 0,         true); // compression method
-    v.setUint16(12, 0,         true); // last mod time
-    v.setUint16(14, 0,         true); // last mod date
-    v.setUint32(16, entry.crc,      true);
-    v.setUint32(20, entry.size,     true); // compressed
-    v.setUint32(24, entry.size,     true); // uncompressed
-    v.setUint16(28, entry.filenameBytes.length, true);
-    v.setUint16(30, 0, true); // extra
-    v.setUint16(32, 0, true); // comment
-    v.setUint16(34, 0, true); // disk
-    v.setUint16(36, 0, true); // internal attr
-    v.setUint32(38, 0, true); // external attr
-    v.setUint32(42, entry.offset,   true);
-    buf.set(entry.filenameBytes, 46);
-    cdParts.push(buf);
-    cdSize += entryLen;
-  }
+          // ── Data descriptor ──
+          const dd = new Uint8Array(16);
+          const d = new DataView(dd.buffer);
+          d.setUint32(0,  0x08074b50, true);
+          d.setUint32(4,  crc,  true);
+          d.setUint32(8,  size, true);
+          d.setUint32(12, size, true);
+          controller.enqueue(dd);
 
-  // ── End of central directory ──
-  const eocd = new Uint8Array(22);
-  const e = new DataView(eocd.buffer);
-  e.setUint32(0,  0x06054b50, true);
-  e.setUint16(4,  0, true);
-  e.setUint16(6,  0, true);
-  e.setUint16(8,  centralEntries.length, true);
-  e.setUint16(10, centralEntries.length, true);
-  e.setUint32(12, cdSize,     true);
-  e.setUint32(16, currentOffset, true);
-  e.setUint16(20, 0, true);
+          centralEntries.push({ filenameBytes, crc, size, offset: currentOffset });
+          currentOffset += headerLen + size + 16;
+        }
 
-  // 拼接所有部分
-  const total = currentOffset + cdSize + 22;
-  const result = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) { result.set(p, off); off += p.length; }
-  for (const p of cdParts) { result.set(p, off); off += p.length; }
-  result.set(eocd, off);
-  return result;
+        // ── Central directory ──
+        let cdSize = 0;
+        for (const entry of centralEntries) {
+          const entryLen = 46 + entry.filenameBytes.length;
+          const buf = new Uint8Array(entryLen);
+          const v = new DataView(buf.buffer);
+          v.setUint32(0,  0x02014b50, true); // signature
+          v.setUint16(4,  20,        true); // version made by
+          v.setUint16(6,  20,        true); // version needed
+          v.setUint16(8,  0x0800 | 0x08, true); // UTF-8 + data descriptor
+          v.setUint16(10, 0,         true); // compression method
+          v.setUint16(12, 0,         true); // last mod time
+          v.setUint16(14, 0,         true); // last mod date
+          v.setUint32(16, entry.crc,      true);
+          v.setUint32(20, entry.size,     true); // compressed
+          v.setUint32(24, entry.size,     true); // uncompressed
+          v.setUint16(28, entry.filenameBytes.length, true);
+          v.setUint16(30, 0, true); // extra
+          v.setUint16(32, 0, true); // comment
+          v.setUint16(34, 0, true); // disk
+          v.setUint16(36, 0, true); // internal attr
+          v.setUint32(38, 0, true); // external attr
+          v.setUint32(42, entry.offset,   true);
+          buf.set(entry.filenameBytes, 46);
+          controller.enqueue(buf);
+          cdSize += entryLen;
+        }
+
+        // ── End of central directory ──
+        const eocd = new Uint8Array(22);
+        const e = new DataView(eocd.buffer);
+        e.setUint32(0,  0x06054b50, true);
+        e.setUint16(4,  0, true);
+        e.setUint16(6,  0, true);
+        e.setUint16(8,  centralEntries.length, true);
+        e.setUint16(10, centralEntries.length, true);
+        e.setUint32(12, cdSize,          true);
+        e.setUint32(16, currentOffset,   true);
+        e.setUint16(20, 0, true);
+        controller.enqueue(eocd);
+
+        controller.close();
+      } catch (err) {
+        controller.error(err);
+      }
+    }
+  });
 }
 
 async function handleZipDownload(request, env) {
@@ -698,7 +808,8 @@ async function handleZipDownload(request, env) {
   if (auth instanceof Response) return auth;
 
   const MAX_COUNT = 50;
-  const MAX_SIZE = 200 * 1024 * 1024;
+  // 流式打包后内存已可控，但仍需限制总体积：Worker 单次请求 CPU/耗时有限，过大必然超时
+  const MAX_SIZE = 50 * 1024 * 1024;
 
   function checkLimits(files) {
     if (files.length > MAX_COUNT) return '文件数量超过限制（最多 ' + MAX_COUNT + ' 个文件）';
@@ -746,16 +857,15 @@ async function handleZipDownload(request, env) {
       }
     }
 
-    // 生成 ZIP
-    const zipData = await generateZip(allFiles, env);
+    // 流式生成 ZIP（边读边写，整包不驻留内存）
+    const zipStream = generateZipStream(allFiles, env);
     const dateStr = new Date().toISOString().slice(0, 10);
     const filename = 'files_' + dateStr + '.zip';
 
-    return new Response(zipData, {
+    return new Response(zipStream, {
       headers: {
         'Content-Type': 'application/zip',
         'Content-Disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
-        'Content-Length': zipData.length,
       }
     });
   } catch (e) {
@@ -764,6 +874,24 @@ async function handleZipDownload(request, env) {
 }
 
 /* ============ 分享（文件分享 + 即时下载） ============ */
+
+// ---- KV 读取内存缓存（优化项①）----
+// 模块级 Map：在单个 Worker 隔离实例内跨请求共享。
+// 设置/限额类 KV 读极频繁（单请求可达多次）但变更极少，
+// 故加短 TTL 缓存：命中即返回，未命中才读 KV；写入时主动失效（见下）。
+const __kvCache = new Map(); // key -> { value, expire }
+const KV_CACHE_TTL = 30 * 1000; // 30 秒
+
+async function kvCachedGet(env, key) {
+  const now = Date.now();
+  const hit = __kvCache.get(key);
+  if (hit && hit.expire > now) return hit.value;
+  const value = await env.KV_STORE.get(key); // 原始字符串
+  __kvCache.set(key, { value, expire: now + KV_CACHE_TTL });
+  return value;
+}
+function kvCacheDelete(key) { __kvCache.delete(key); }
+
 function generateId(length = 12) {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   const array = new Uint8Array(length);
@@ -967,7 +1095,7 @@ async function handleDeleteShare(request, env, shareId) {
 const DEFAULT_SETTINGS = { webdavEnabled: true, webdavReadOnly: false };
 
 async function getGlobalSettings(env) {
-  const raw = await env.KV_STORE.get('settings:global');
+  const raw = await kvCachedGet(env, 'settings:global');
   if (!raw) return { ...DEFAULT_SETTINGS };
   try { return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) }; } catch { return { ...DEFAULT_SETTINGS }; }
 }
@@ -988,6 +1116,7 @@ async function handleUpdateSettings(request, env) {
     if (typeof webdavEnabled === 'boolean') updated.webdavEnabled = webdavEnabled;
     if (typeof webdavReadOnly === 'boolean') updated.webdavReadOnly = webdavReadOnly;
     await env.KV_STORE.put('settings:global', JSON.stringify(updated));
+    kvCacheDelete('settings:global');
     return jsonResponse({ success: true, settings: updated, message: '设置已更新' });
   } catch (e) {
     return jsonResponse({ success: false, message: '更新设置失败: ' + e.message }, 500);
@@ -1025,6 +1154,39 @@ function davHeaders(obj, filename) {
     'Last-Modified': rfc1123Date(obj.uploaded),
     'Accept-Ranges': 'bytes'
   });
+}
+
+// 协商缓存判定：比对 If-None-Match(ETag) / If-Modified-Since，命中返回 true（调用方回 304）
+// 有 If-None-Match 时按 RFC 优先于 If-Modified-Since，不再回退到时间比对
+function notModified(meta, request) {
+  if (!meta) return false;
+  const etag = meta.etag ? `"${meta.etag}"` : (meta.httpEtag || '');
+
+  const inm = request.headers.get('If-None-Match');
+  if (inm) {
+    if (inm.trim() === '*') return true;
+    if (!etag) return false;
+    return inm.split(',').some(v => v.trim().replace(/^W\//, '') === etag);
+  }
+
+  const ims = request.headers.get('If-Modified-Since');
+  if (ims && meta.uploaded) {
+    const since = Date.parse(ims);
+    if (!Number.isNaN(since)) {
+      // HTTP 时间精度只到秒，比对时统一截断到秒，避免亚秒误差导致误判未命中
+      return Math.floor(new Date(meta.uploaded).getTime() / 1000) <= Math.floor(since / 1000);
+    }
+  }
+  return false;
+}
+
+// 构造 304 响应头：只带校验相关字段，不带 body 相关字段
+function notModifiedHeaders(meta) {
+  return {
+    'ETag': meta.etag ? `"${meta.etag}"` : (meta.httpEtag || ''),
+    'Last-Modified': rfc1123Date(meta.uploaded),
+    'Accept-Ranges': 'bytes'
+  };
 }
 
 // DAV 资源(文件)与集合(文件夹)的 propstat 块，供 PROPFIND 复用
@@ -1120,7 +1282,7 @@ async function handleDavPropfind(request, env, davPath) {
   try {
     const depth = request.headers.get('Depth') || 'infinity';
     const baseUrl = new URL(request.url).origin + '/dav/';
-    const fileObj = davPath ? await env.R2_BUCKET.get(davPath) : null;
+    const fileObj = davPath ? await env.R2_BUCKET.head(davPath) : null;  // 取元数据即可，不下载 body（省资源）
     if (fileObj) {
       const name = davPath.split('/').pop();
       const mtime = fileObj.uploaded || new Date();
@@ -1134,33 +1296,8 @@ ${davResourcePropstat(name, fileObj.size, fileObj.etag, fileObj.httpMetadata?.co
       return new Response(xml, { status: 207, headers: { 'Content-Type': 'application/xml; charset=utf-8' } });
     }
     const prefix = davPath ? davPath + '/' : '';
-    const objects = [];
-    let folders = new Set();
-    let cursor;
-    let pages = 0;
     const MAX_PAGES = 10;  // 翻页封顶(~1万项)，防止极端大目录拖垮单次请求
-    do {
-      const batch = await env.R2_BUCKET.list({
-        prefix,
-        delimiter: '/',
-        limit: 1000,
-        cursor
-      });
-      if (batch.objects) {
-        for (const obj of batch.objects) {
-          if (obj.key.endsWith('/.keep') || obj.key.endsWith('/.folder')) continue;
-          objects.push(obj);
-        }
-      }
-      if (batch.delimitedPrefixes) {
-        for (const dp of batch.delimitedPrefixes) {
-          const folderName = dp.replace(prefix, '').replace(/\/$/, '');
-          if (folderName) folders.add(folderName);
-        }
-      }
-      cursor = batch.truncated ? batch.cursor : null;
-      pages++;
-    } while (cursor && pages < MAX_PAGES);
+    const { objects, folders } = await listDir(env, prefix, MAX_PAGES);
 
     let xml = '<d:multistatus xmlns:d="DAV:">\n';
     xml += `  <d:response>
@@ -1224,6 +1361,10 @@ async function handleDavGet(request, env, davPath) {
       // Range 续传：先 head 取元数据(不下载 body)，再按区间取切片(206)，避免拉整文件
       const meta = await env.R2_BUCKET.head(key);
       if (!meta) return await collectionOr404();
+      // 客户端缓存仍有效且未要求重取整个区间：回 304，不下行 body
+      if (notModified(meta, request) && !request.headers.get('If-Range')) {
+        return new Response(null, { status: 304, headers: notModifiedHeaders(meta) });
+      }
       const match = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader.trim());
       if (match) {
         const start = parseInt(match[1]);
@@ -1246,6 +1387,10 @@ async function handleDavGet(request, env, davPath) {
     // 无 Range：直接整文件下载（1 次 get），不提前拉整文件用于校验
     const obj = await env.R2_BUCKET.get(key);
     if (!obj) return await collectionOr404();
+    // 协商缓存命中：直接 304，不下行 body
+    if (notModified(obj, request)) {
+      return new Response(null, { status: 304, headers: notModifiedHeaders(obj) });
+    }
     return new Response(obj.body, { status: 200, headers: davHeaders(obj, filename) });
   } catch (e) {
     return new Response('Internal Server Error: ' + e.message, { status: 500 });
@@ -1265,6 +1410,11 @@ async function handleDavHead(request, env, davPath) {
         return new Response(null, { status: 200, headers: { 'Content-Type': 'httpd/unix-directory' } });
       }
       return new Response(null, { status: 404 });
+    }
+
+    // 协商缓存命中：直接 304，HEAD 本就无 body，这里进一步省掉后续处理
+    if (notModified(meta, request)) {
+      return new Response(null, { status: 304, headers: notModifiedHeaders(meta) });
     }
 
     return new Response(null, {
@@ -3777,9 +3927,8 @@ sortedFiles.forEach(file => {
           });
           xhr.addEventListener('error', () => { failCount++; resolve(); });
           xhr.open('POST', '/api/files' + currentPath);
-          const fd = new FormData();
-          fd.append('file', file);
-          xhr.send(fd);
+          xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+          xhr.send(file);
         });
       }
 
@@ -5015,13 +5164,20 @@ function buildPagePasswordPage(pageName, errorMsg) {
 </html>`;
 }
 
-async function servePageContent(page, env) {
+async function servePageContent(page, env, ctx) {
   const object = await env.R2_BUCKET.get(page.filePath);
   if (!object) return htmlResponse(PAGE_NOT_FOUND_PAGE, 404);
 
   page.viewCount = (page.viewCount || 0) + 1;
-  await env.KV_STORE.put(`page:${page.pageName}`, JSON.stringify(page));
-  await incrementStat(env, 'stats:totalViews');
+  // 优化项②：浏览计数与统计写入改为后台异步，不阻塞分享页响应
+  const persist = (async () => {
+    try {
+      await env.KV_STORE.put(`page:${page.pageName}`, JSON.stringify(page));
+      await incrementStat(env, 'stats:totalViews');
+    } catch (e) { /* 后台写入失败不影响页面展示 */ }
+  })();
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(persist);
+  else await persist; // 极端情况无 ctx 时回退为同步，保证不丢计数
 
   return new Response(object.body, {
     headers: {
@@ -5033,7 +5189,7 @@ async function servePageContent(page, env) {
   });
 }
 
-async function handlePageView(request, env, pageName) {
+async function handlePageView(request, env, pageName, ctx) {
   const raw = await env.KV_STORE.get(`page:${pageName}`);
   if (!raw) return htmlResponse(PAGE_NOT_FOUND_PAGE, 404);
   const page = JSON.parse(raw);
@@ -5045,12 +5201,12 @@ async function handlePageView(request, env, pageName) {
       if (!password || await hashPassword(password) !== page.passwordHash) {
         return htmlResponse(buildPagePasswordPage(pageName, '密码错误'), 401);
       }
-      return await servePageContent(page, env);
+      return await servePageContent(page, env, ctx);
     }
     return htmlResponse(buildPagePasswordPage(pageName, ''));
   }
 
-  return await servePageContent(page, env);
+  return await servePageContent(page, env, ctx);
 }
 
 export default {
@@ -5188,7 +5344,7 @@ export default {
       if (path.startsWith('/p/')) {
         const pageName = decodeURIComponent(path.slice('/p/'.length));
         if (!pageName) return htmlResponse(PAGE_NOT_FOUND_PAGE, 404);
-        return await handlePageView(request, env, pageName);
+        return await handlePageView(request, env, pageName, ctx);
       }
 
       if (path === '/login.html' || path === '/login') {
