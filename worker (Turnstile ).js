@@ -1010,8 +1010,9 @@ async function handleEditFile(request, env, path) {
     try {
       const object = await env.R2_BUCKET.get(key);
       if (!object) return jsonResponse({ success: false, message: '文件不存在' }, 404);
-      return new Response(await object.text(), {
-        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
+      // 返回原始字节（不再按 UTF-8 解码），前端按检测到的编码自行解码，保证 GBK 等编码可原样读回
+      return new Response(await object.arrayBuffer(), {
+        headers: { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' }
       });
     } catch (e) {
       return jsonResponse({ success: false, message: '读取失败: ' + e.message }, 500);
@@ -1020,8 +1021,10 @@ async function handleEditFile(request, env, path) {
 
   if (request.method === 'PUT') {
     try {
-      const content = await request.text();
-      await env.R2_BUCKET.put(key, content, { httpMetadata: { contentType: 'text/plain; charset=utf-8' } });
+      // 接收前端发来的原始字节（前端按目标编码编码后发送），避免后端再次 UTF-8 解码破坏 GBK 等编码
+      const body = await request.arrayBuffer();
+      const charset = (request.headers.get('X-File-Charset') || 'utf-8').toLowerCase();
+      await env.R2_BUCKET.put(key, body, { httpMetadata: { contentType: 'text/plain; charset=' + charset } });
       return jsonResponse({ success: true, message: '保存成功' });
     } catch (e) {
       return jsonResponse({ success: false, message: '保存失败: ' + e.message }, 500);
@@ -4378,12 +4381,16 @@ sortedFiles.forEach(file => {
 
       filenameEl.textContent = filename;
       downloadBtn.onclick = () => downloadFile(path);
+      // 记录当前预览文件，保存后用于自动刷新（绕过缓存）
+      previewCurrentPath = path;
+      previewCurrentType = previewType;
+      previewCurrentName = filename;
 
       content.innerHTML = '<div class="preview-loading"><div class="spinner"></div><div>加载中...</div></div>';
       overlay.classList.add('active');
 
       try {
-        const previewUrl = '/api/preview' + path;
+        const previewUrl = '/api/preview' + path + '?_=' + Date.now();
 
         switch (previewType) {
           case 'image':
@@ -4611,6 +4618,101 @@ sortedFiles.forEach(file => {
     let editorFullscreen = false;
     let editorRawBytes = null;
     let editorCurrentEncoding = 'utf-8';
+    let editorNewline = '\\n';
+    let previewCurrentPath = null;
+    let previewCurrentType = null;
+    let previewCurrentName = null;
+
+    // ===== 编码辅助：在线编码库（仅 GBK/ANSI 保存时需要，懒加载，正常 UTF-8 用户不下载） =====
+    let _encodingLibPromise = null;
+    function ensureEncodingLib() {
+      if (window.Encoding) return Promise.resolve(window.Encoding);
+      if (_encodingLibPromise) return _encodingLibPromise;
+      _encodingLibPromise = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/encoding@0.1.13/encoding.js';
+        s.async = true;
+        s.onload = () => window.Encoding ? resolve(window.Encoding) : reject(new Error('编码库未暴露全局 Encoding'));
+        s.onerror = () => reject(new Error('编码库加载失败（CDN 不可达）'));
+        document.head.appendChild(s);
+      });
+      return _encodingLibPromise;
+    }
+
+    // 编码库返回结果可能是 Buffer / Uint8Array / 普通数组 / 二进制字符串，统一成 Uint8Array
+    function encodingResultToBytes(result) {
+      if (result == null) return null;
+      if (result instanceof Uint8Array) return new Uint8Array(result);
+      if (typeof Buffer !== 'undefined' && Buffer.isBuffer(result)) return new Uint8Array(result);
+      if (Array.isArray(result)) return new Uint8Array(result);
+      if (typeof result === 'string') {
+        const u = new Uint8Array(result.length);
+        for (let i = 0; i < result.length; i++) u[i] = result.charCodeAt(i) & 0xff;
+        return u;
+      }
+      // 兜底：类数组（旧版 Buffer shim 等，有 length 且可按索引取字节）
+      if (typeof result.length === 'number') {
+        const u = new Uint8Array(result.length);
+        for (let i = 0; i < result.length; i++) u[i] = result[i] & 0xff;
+        return u;
+      }
+      return null;
+    }
+
+    // 把编辑器文本按目标编码编码成字节。纯 UTF-8 走内置；其余编码（GBK/ANSI、UTF-8-BOM、UTF-16 LE/BE）
+    // 统一走在线编码库（encoding 包，iconv-lite 内核），避免手写编码出错，也方便后续扩展更多编码。
+    // 返回 null 表示无法按该编码编码（调用方应退回 UTF-8），避免写坏文件。
+    async function encodeContentToBytes(content, encoding) {
+      // 纯 UTF-8 走内置 API，不依赖在线库（最常见场景，零额外下载）
+      if (encoding === 'utf-8') {
+        return new TextEncoder().encode(content);
+      }
+      // 其余编码统一映射为库支持的编码名（iconv-lite 规范名，大小写不敏感），交给在线编码库
+      const encMap = {
+        'ansi': 'gbk', 'gbk': 'gbk',
+        'utf-8-bom': 'utf-8',
+        'utf-16le': 'utf-16le', 'utf-16be': 'utf-16be'
+      };
+      const target = encMap[encoding] || 'utf-8';
+      const checkEnc = { 'gbk': 'gb18030', 'utf-8': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16be': 'utf-16be' }[target] || 'utf-8';
+      try {
+        const Encoding = await ensureEncodingLib();
+        // encoding.convert 对 JS 字符串会按目标编码“编码”成字节（返回 Buffer）
+        const out = encodingResultToBytes(Encoding.convert(content, target, 'utf-8'));
+        // 往返校验：编码字节必须能无损解码回原文，否则退回（避免写坏文件或丢字符）
+        if (out && new TextDecoder(checkEnc).decode(out) === content) {
+          if (encoding === 'utf-8-bom') {
+            const withBom = new Uint8Array(out.length + 3);
+            withBom[0] = 0xEF; withBom[1] = 0xBB; withBom[2] = 0xBF;
+            withBom.set(out, 3);
+            return withBom;
+          }
+          return out;
+        }
+      } catch (e) {}
+      // 在线库不可用 / 不支持该编码：UTF-16 用内置精确实现兜底，其余（GBK/UTF-8-BOM）退回 UTF-8（调用方会提示）
+      if (encoding === 'utf-16le' || encoding === 'utf-16be') {
+        const u = new Uint8Array(content.length * 2);
+        for (let i = 0; i < content.length; i++) {
+          const c = content.charCodeAt(i);
+          if (encoding === 'utf-16le') { u[i * 2] = c & 0xff; u[i * 2 + 1] = (c >> 8) & 0xff; }
+          else { u[i * 2] = (c >> 8) & 0xff; u[i * 2 + 1] = c & 0xff; }
+        }
+        return u;
+      }
+      return null;
+    }
+
+    // 编码 -> 存储用 charset（写进 R2 content-type，供预览/下载正确解码）
+    function encodingToCharset(encoding) {
+      switch (encoding) {
+        case 'ansi': case 'gbk': return 'gbk';
+        case 'utf-8-bom': return 'utf-8';
+        case 'utf-16le': return 'utf-16le';
+        case 'utf-16be': return 'utf-16be';
+        default: return 'utf-8';
+      }
+    }
 
     async function openEditor(filePath, filename) {
       try {
@@ -4623,10 +4725,17 @@ sortedFiles.forEach(file => {
         }
         const arrayBuffer = await res.arrayBuffer();
         editorRawBytes = new Uint8Array(arrayBuffer);
-        editorCurrentEncoding = 'utf-8';
+        editorCurrentEncoding = detectEncoding(editorRawBytes);
         const content = decodeWithEncoding(editorRawBytes, editorCurrentEncoding);
+        // 记录原文件换行风格，保存时还原，避免 Windows（CRLF）文件被统一改成 LF
+        editorNewline = /\\r\\n/.test(content) ? '\\r\\n' : '\\n';
         updateEncodingMenuChecked(editorCurrentEncoding);
         updateEncodingStatus(editorCurrentEncoding);
+        // 非 UTF-8 编码提示：现在会按原编码保存（GBK 等依赖在线编码库），告知用户
+        if (editorCurrentEncoding !== 'utf-8' && editorCurrentEncoding !== 'utf-8-bom') {
+          const encLabel = (editorCurrentEncoding === 'gbk' || editorCurrentEncoding === 'ansi') ? 'GBK/GB2312' : editorCurrentEncoding.toUpperCase();
+          showToast('检测到非 UTF-8 编码（' + encLabel + '），将按原编码保存', 'warning');
+        }
 
         document.getElementById('editorFilename').textContent = filename;
         editorCurrentPath = filePath;
@@ -4712,11 +4821,22 @@ sortedFiles.forEach(file => {
       try {
         document.getElementById('editorSaveBtn').disabled = true;
         document.getElementById('editorSaveBtn').textContent = '⏳ 保存中...';
-        const content = aceEditor.getValue();
+        const content = aceEditor.getValue(editorNewline);
+        // 按当前编码把文本编码成字节；非 UTF-8（GBK）走在线编码库，失败或无法表示则退回 UTF-8 并提示
+        let bytes, charset;
+        try {
+          bytes = await encodeContentToBytes(content, editorCurrentEncoding);
+          if (!bytes) throw new Error('编码结果为空');
+          charset = encodingToCharset(editorCurrentEncoding);
+        } catch (e) {
+          bytes = new TextEncoder().encode(content);
+          charset = 'utf-8';
+          showToast('GBK 编码不可用，已按 UTF-8 保存', 'warning');
+        }
         const res = await fetch('/api/edit' + editorCurrentPath, {
           method: 'PUT',
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-          body: content
+          headers: { 'Content-Type': 'application/octet-stream', 'X-File-Charset': charset },
+          body: bytes
         });
         const d = await res.json().catch(() => ({}));
         if (res.ok && d.success) {
@@ -4724,6 +4844,11 @@ sortedFiles.forEach(file => {
           showToast('文件已保存', 'success');
           
           if (typeof loadFiles === 'function') loadFiles();
+          // 若预览层正显示同一文件，编辑保存后自动刷新预览内容
+          if (previewCurrentPath && previewCurrentPath === editorCurrentPath &&
+              document.getElementById('previewOverlay')?.classList.contains('active')) {
+            previewFile(previewCurrentPath, previewCurrentType, previewCurrentName);
+          }
         } else {
           showToast(d.message || '保存失败', 'error');
         }
@@ -4748,12 +4873,40 @@ sortedFiles.forEach(file => {
 
     function decodeWithEncoding(bytes, encoding) {
       try {
-        const decoder = new TextDecoder(encoding, { fatal: false });
-        return decoder.decode(bytes);
+        // 归一化：'utf-8-bom' 不是 TextDecoder 合法标签，按 utf-8 解码（BOM 会被自动剥离）；
+        // 'ansi' 归一到 gbk；其余取原名
+        let decEnc = encoding;
+        if (decEnc === 'utf-8-bom' || decEnc === 'ansi') decEnc = (decEnc === 'ansi') ? 'gbk' : 'utf-8';
+        const decoder = new TextDecoder(decEnc, { fatal: false });
+        let s = decoder.decode(bytes);
+        // utf-16 变体默认不自动剥离 BOM 字符，手动去掉解码后可能残留的 U+FEFF，避免编辑框出现乱码首字符
+        if (s.charCodeAt(0) === 0xFEFF) s = s.slice(1);
+        return s;
       } catch (e) {
         showToast('不支持的编码: ' + encoding, 'error');
         return '';
       }
+    }
+
+    // 打开文件时自动嗅探编码：先按 BOM 字节前缀判定 UTF-8-BOM / UTF-16，再试 UTF-8，其次 GBK，嗅不到则回退 UTF-8
+    // 浏览器/Workerd 的 TextDecoder 原生支持 gbk/gb18030，无需引入额外库
+    function detectEncoding(bytes) {
+      // 0. BOM 字节前缀优先判定（避免 UTF-16 被误判为 GBK、UTF-8-BOM 被压成无 BOM）
+      if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) return 'utf-8-bom';
+      if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) return 'utf-16le';
+      if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) return 'utf-16be';
+      // 1. 先试 UTF-8：能完整解码且不含替换符即为 UTF-8
+      try {
+        const s = new TextDecoder('utf-8').decode(bytes);
+        if (s.indexOf('�') === -1) return 'utf-8';
+      } catch (e) {}
+      // 2. 再试 GBK / GB2312（用 gb18030 超集覆盖）
+      try {
+        const s = new TextDecoder('gb18030').decode(bytes);
+        if (s.indexOf('�') === -1) return 'gbk';
+      } catch (e) {}
+      // 3. 回退
+      return 'utf-8';
     }
 
     function updateEncodingStatus(encoding) {

@@ -6,12 +6,13 @@
 
 0.05版
 
-- 1.加 KV 读取缓存 + 分享页计数异步化
-- 2.WebDAV 列表/搜索/Range/304/拷贝并发优化
-- 3.添加 Turnstile 人机验证（仅单独版本 worker (Turnstile).js 包含，功能可能被墙，仅用于测试）：worker.js 本体不含 Turnstile。
-- 4.添加 Range 续传 + Accept-Ranges：大文件不用整段流式返回，省 CPU 时间（免费版瓶颈），也支持断点续传。不增加操作数（仍是 1 次 GET）。
-- 5.HEAD 不再下载整文件：当前 HEAD 走 get(key) 拉全量 body 再丢弃，改成 head(key) 只取元数据——HEAD 请求从「1 次整文件 GET」降为「1 次 head」。
-- 6.depth=1 翻页（正确性+封顶）：当前 list 不翻页，目录超 1000 子项会静默截断；加 cursor 翻页并封顶 10 页（~1 万项），避免大目录漏文件导致客户端反复重试。
+- 加 KV 读取缓存 + 分享页计数异步化
+- WebDAV 列表/搜索/Range/304/拷贝并发优化
+- Ace 编辑器的格式隐患/编码隐患优化. 文本预览编辑缓存问题.
+- 添加 Turnstile 人机验证（仅单独版本 worker (Turnstile).js 包含，功能可能被墙，仅用于测试）：worker.js 本体不含 Turnstile。
+- 添加 Range 续传 + Accept-Ranges：大文件不用整段流式返回，省 CPU 时间（免费版瓶颈），也支持断点续传。不增加操作数（仍是 1 次 GET）。
+- HEAD 不再下载整文件：当前 HEAD 走 get(key) 拉全量 body 再丢弃，改成 head(key) 只取元数据——HEAD 请求从「1 次整文件 GET」降为「1 次 head」。
+- depth=1 翻页（正确性+封顶）：当前 list 不翻页，目录超 1000 子项会静默截断；加 cursor 翻页并封顶 10 页（~1 万项），避免大目录漏文件导致客户端反复重试。
 
 ## 预览
 
