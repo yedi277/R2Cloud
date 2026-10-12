@@ -5955,7 +5955,6 @@ async function servePageContent(page, env, ctx) {
   if (!object) return htmlResponse(PAGE_NOT_FOUND_PAGE, 404);
 
   page.viewCount = (page.viewCount || 0) + 1;
-  // 优化项②：浏览计数与统计写入改为后台异步，不阻塞分享页响应
   const persist = (async () => {
     try {
       await env.KV_STORE.put(`page:${page.pageName}`, JSON.stringify(page));
@@ -5963,12 +5962,25 @@ async function servePageContent(page, env, ctx) {
     } catch (e) { /* 后台写入失败不影响页面展示 */ }
   })();
   if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(persist);
-  else await persist; // 极端情况无 ctx 时回退为同步，保证不丢计数
+  else await persist;
+
+  // ① 优先使用上传时存的 httpMetadata.contentType
+  // ② 退化到按扩展名推断（getMimeType）
+  // ③ 最后兜底 application/octet-stream
+  const contentType =
+    object.httpMetadata?.contentType ||
+    getMimeType(page.fileName) ||
+    'application/octet-stream';
+
+  // 图片/视频/音频/PDF 等浏览器能直接渲染的类型 → inline 内嵌
+  // 其他类型（zip/docx/xlsx 等）→ attachment 触发下载
+  const inlineTypes = /^(image\/|video\/|audio\/|text\/|application\/pdf|application\/javascript|application\/json|application\/xml|image\/svg)/;
+  const disposition = inlineTypes.test(contentType) ? 'inline' : 'attachment';
 
   return new Response(object.body, {
     headers: {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Content-Disposition': 'inline',
+      'Content-Type': contentType,
+      'Content-Disposition': `${disposition}; filename="${encodeURIComponent(page.fileName)}"`,
       'Content-Length': object.size,
       'Cache-Control': 'no-store'
     }
